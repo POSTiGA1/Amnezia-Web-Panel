@@ -47,6 +47,31 @@ AWG_DEFAULTS = {
     'underload_packet_magic_header': '1766607858',
 }
 
+# AWG 3.1 parameters: (internal key, config key).
+# HeaderProtectionKey/ContentPaddingAddition and the timings came with 3.0,
+# RandomTrailers/DisableCookies with 3.1. Ranges use the "min-max" form.
+AWG3_PARAM_MAP = [
+    ('header_protection_key', 'HeaderProtectionKey'),
+    ('content_padding_addition', 'ContentPaddingAddition'),
+    ('rekey_after_time', 'RekeyAfterTime'),
+    ('rekey_timeout', 'RekeyTimeout'),
+    ('reject_after_time', 'RejectAfterTime'),
+    ('keepalive_timeout', 'KeepaliveTimeout'),
+    ('max_handshake_attempts', 'MaxHandshakeAttempts'),
+    ('random_trailers', 'RandomTrailers'),
+    ('disable_cookies', 'DisableCookies'),
+]
+
+# AWG 3.1 keys must not leak into legacy configs — the legacy container
+# ships tools that reject them.
+AWG3_CONFIG_KEYS = tuple(config_key for _, config_key in AWG3_PARAM_MAP)
+
+# With HeaderProtectionKey set, the kernel module requires every junk size
+# S1-S4 to be at least HEADER_PROTECTION_NONCE_SIZE (12) — see the S1..S4
+# checks in netlink.c. Below that `awg setconf` fails with a bare
+# "Invalid argument": the explanation only goes to net_dbg_ratelimited.
+AWG3_MIN_JUNK_SIZE = 12
+
 
 def generate_wg_keypair():
     """Generate a WireGuard X25519 keypair (private, public) as base64 strings."""
@@ -68,23 +93,27 @@ def generate_psk():
     return b64encode(secrets.token_bytes(32)).decode()
 
 
-def generate_awg_params(use_ranges=False):
+def generate_awg_params(use_ranges=False, awg3=False):
     """Generate random AWG obfuscation parameters.
     
     For AWG 2.0 (use_ranges=True): generates H1-H4 as non-overlapping
     ranges (min-max) for dynamic packet signature. Each packet gets a
     random value from its range, defeating static DPI signatures.
     For legacy AWG (use_ranges=False): generates fixed single H values.
+    For AWG 3.1 (awg3=True): additionally generates header protection key,
+    content padding and randomized protocol timings.
     """
     import random
 
     jc = random.randint(1, 10)
     jmin = random.randint(5, 20)
     jmax = random.randint(jmin + 10, jmin + 50)
-    s1 = random.randint(10, 50)
-    s2 = random.randint(10, 50)
-    s3 = random.randint(10, 50)
-    s4 = random.randint(10, 50)
+    # AWG 3.1 enables header protection, which puts a floor under the junk sizes.
+    s_min = AWG3_MIN_JUNK_SIZE if awg3 else 10
+    s1 = random.randint(s_min, 50)
+    s2 = random.randint(s_min, 50)
+    s3 = random.randint(s_min, 50)
+    s4 = random.randint(s_min, 50)
 
     if use_ranges:
         # AWG 2.0: H1-H4 as non-overlapping ranges (min-max)
@@ -109,7 +138,7 @@ def generate_awg_params(use_ranges=False):
         h3 = str(random.randint(100000000, 4294967295))
         h4 = str(random.randint(100000000, 4294967295))
 
-    return {
+    params = {
         'junk_packet_count': str(jc),
         'junk_packet_min_size': str(jmin),
         'junk_packet_max_size': str(jmax),
@@ -123,6 +152,31 @@ def generate_awg_params(use_ranges=False):
         'transport_packet_magic_header': h4,
     }
 
+    if awg3:
+        # Ranges are "min-max" (u16_range_from_string in amneziawg-tools).
+        # reject_after_time must stay above rekey_after_time, otherwise a
+        # session is dropped before the rekey window opens.
+        rekey_after = random.randint(100, 130)
+        reject_after = random.randint(rekey_after + 40, rekey_after + 70)
+        keepalive = random.randint(8, 12)
+        rekey_timeout = random.randint(4, 6)
+        attempts = random.randint(15, 20)
+        padding_min = random.randint(8, 24)
+
+        params.update({
+            'header_protection_key': generate_psk(),
+            'content_padding_addition': f"{padding_min}-{padding_min + random.randint(24, 48)}",
+            'rekey_after_time': f"{rekey_after}-{rekey_after + random.randint(10, 40)}",
+            'rekey_timeout': f"{rekey_timeout}-{rekey_timeout + random.randint(1, 3)}",
+            'reject_after_time': f"{reject_after}-{reject_after + random.randint(10, 30)}",
+            'keepalive_timeout': f"{keepalive}-{keepalive + random.randint(2, 6)}",
+            'max_handshake_attempts': f"{attempts}-{attempts + random.randint(2, 6)}",
+            'random_trailers': 'on',
+            'disable_cookies': 'on',
+        })
+
+    return params
+
 
 class AWGManager:
     """Manages AmneziaWG protocol installation and client management."""
@@ -131,6 +185,7 @@ class AWGManager:
     AWG = 'awg'          # New AWG (awg-go based, uses awg/awg-quick)
     AWG_LEGACY = 'awg_legacy'  # Legacy AWG (uses wg/wg-quick)
     AWG2 = 'awg2'        # AmneziaWG 2.0 (separate container amnezia-awg2)
+    AWG3 = 'awg3'        # AmneziaWG 3.1 (separate container amnezia-awg3)
 
     def __init__(self, ssh_manager):
         self.ssh = ssh_manager
@@ -158,6 +213,8 @@ class AWGManager:
             name = 'amnezia-awg-legacy'
         elif base == self.AWG2:
             name = 'amnezia-awg2'
+        elif base == self.AWG3:
+            name = 'amnezia-awg3'
         else:
             name = 'amnezia-awg'
         return name if idx <= 1 else f'{name}-{idx}'
@@ -220,7 +277,7 @@ class AWGManager:
 
     def _docker_image(self, protocol_type):
         """Get Docker image for protocol type."""
-        if self._base_protocol(protocol_type) in (self.AWG, self.AWG2):
+        if self._base_protocol(protocol_type) in (self.AWG, self.AWG2, self.AWG3):
             return 'amneziavpn/amneziawg-go:latest'
         return 'amneziavpn/amnezia-wg:latest'
 
@@ -398,7 +455,11 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
             port = AWG_DEFAULTS['port']
 
         if awg_params is None:
-            awg_params = generate_awg_params(use_ranges=(self._base_protocol(protocol_type) in (self.AWG, self.AWG2)))
+            base_proto = self._base_protocol(protocol_type)
+            awg_params = generate_awg_params(
+                use_ranges=(base_proto in (self.AWG, self.AWG2, self.AWG3)),
+                awg3=(base_proto == self.AWG3),
+            )
 
         container_name = self._container_name(protocol_type)
         docker_image = self._docker_image(protocol_type)
@@ -547,12 +608,20 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
         subnet_ip = self._get_subnet_ip(protocol_type)
         subnet_cidr = self._get_subnet_cidr(protocol_type)
 
+        # AWG 3.1 parameters are written only when the protocol asks for them,
+        # so awg/awg2 installations keep byte-identical configs.
+        awg3_config_lines = ''.join(
+            f"{config_key} = {awg_params[param_key]}\n"
+            for param_key, config_key in AWG3_PARAM_MAP
+            if awg_params.get(param_key)
+        )
+
         address_line = f"{subnet_ip}/{subnet_cidr}"
         if ipv6:
-            address_line += f", {AWG_DEFAULTS['subnet_ipv6_ip']}/{AWG_DEFAULTS['subnet_ipv6_cidr']}"
-
+            address_line += f", {AWG_DEFAULTS['subnet_ipv6_ip']}/{AWG_DEFAULTS['subnet_ipv6_cidr']}"     
+        
         # Build the server config generation script
-        if self._base_protocol(protocol_type) in (self.AWG, self.AWG2):
+        if self._base_protocol(protocol_type) in (self.AWG, self.AWG2, self.AWG3):
             config_script = f"""
 mkdir -p /opt/amnezia/awg
 cd /opt/amnezia/awg
@@ -581,7 +650,7 @@ H1 = {awg_params['init_packet_magic_header']}
 H2 = {awg_params['response_packet_magic_header']}
 H3 = {awg_params['underload_packet_magic_header']}
 H4 = {awg_params['transport_packet_magic_header']}
-# Signature Chain parameters (AWG 2.0+)
+{awg3_config_lines}# Signature Chain parameters (AWG 2.0+)
 # I1 = 0
 # I2 = 0
 # I3 = 0
@@ -887,6 +956,7 @@ tail -f /dev/null
             'I5': 'i5',
             'CPS': 'cps',
         }
+        param_map.update({config_key: param_key for param_key, config_key in AWG3_PARAM_MAP})
 
         for line in config.split('\n'):
             line = line.strip()
@@ -1235,13 +1305,13 @@ AllowedIPs = {allowed_ips}
             ('i4', 'I4'),
             ('i5', 'I5'),
             ('cps', 'CPS')
-        ]
+        ] + AWG3_PARAM_MAP
 
         for param_key, config_key in mapping:
             val = awg_params.get(param_key)
             if val:
                 # Basic compatibility filtering
-                if self._base_protocol(protocol_type) == self.AWG_LEGACY and config_key in ('S3', 'S4', 'I1', 'I2', 'I3', 'I4', 'I5', 'CPS'):
+                if self._base_protocol(protocol_type) == self.AWG_LEGACY and config_key in ('S3', 'S4', 'I1', 'I2', 'I3', 'I4', 'I5', 'CPS') + AWG3_CONFIG_KEYS:
                     continue
                 config_lines.append(f"{config_key} = {val}")
 
@@ -1327,13 +1397,13 @@ PersistentKeepalive = 25
             ('i4', 'I4'),
             ('i5', 'I5'),
             ('cps', 'CPS')
-        ]
+        ] + AWG3_PARAM_MAP
 
         for param_key, config_key in mapping:
             val = awg_params.get(param_key)
             if val:
                 # Basic compatibility filtering
-                if self._base_protocol(protocol_type) == self.AWG_LEGACY and config_key in ('S3', 'S4', 'I1', 'I2', 'I3', 'I4', 'I5', 'CPS'):
+                if self._base_protocol(protocol_type) == self.AWG_LEGACY and config_key in ('S3', 'S4', 'I1', 'I2', 'I3', 'I4', 'I5', 'CPS') + AWG3_CONFIG_KEYS:
                     continue
                 config_lines.append(f"{config_key} = {val}")
 
