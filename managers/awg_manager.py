@@ -1278,10 +1278,10 @@ AllowedIPs = {allowed_ips}
 
         # Standard fields (dual-stack when the client has an IPv6 address)
         address_line = f"{client_ip}/32" + (f", {client_ipv6}/128" if client_ipv6 else "")
-        dns_line = dns + (", 2606:4700:4700::1111" if client_ipv6 else "")
+        dns_line = f"{dns1}, {dns2}" + (", 2606:4700:4700::1111" if client_ipv6 else "")
         config_lines = [
-            f"Address = {address_line}",
-            f"DNS = {dns_line}",
+            f"Address = {client_ip}/32",
+            f"DNS = {dns}",
             f"PrivateKey = {client_priv_key}",
             f"MTU = {mtu}"
         ]
@@ -1370,10 +1370,10 @@ PersistentKeepalive = 25
 
         # Standard fields (dual-stack when the client has an IPv6 address)
         address_line = f"{client_ip}/32" + (f", {client_ipv6}/128" if client_ipv6 else "")
-        dns_line = dns + (", 2606:4700:4700::1111" if client_ipv6 else "")
+        dns_line = f"{dns1}, {dns2}" + (", 2606:4700:4700::1111" if client_ipv6 else "")
         config_lines = [
-            f"Address = {address_line}",
-            f"DNS = {dns_line}",
+            f"Address = {client_ip}/32",
+            f"DNS = {dns}",
             f"PrivateKey = {client_priv_key}",
             f"MTU = {mtu}"
         ]
