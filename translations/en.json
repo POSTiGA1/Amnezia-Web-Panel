@@ -419,5 +419,9 @@
   "backup_created": "Backup created",
   "no_backups": "No backups yet",
   "no_backups_desc": "Create the first backup for this protocol.",
-  "refresh": "Refresh"
+  "refresh": "Refresh",
+  "rename": "Rename",
+  "connection_renamed": "Connection renamed",
+  "enter_connection_name": "Enter a new connection name",
+  "config_saved": "Config saved"
 }
