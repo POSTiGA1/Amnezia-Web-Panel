@@ -757,8 +757,25 @@ tail -f /dev/null
             raise RuntimeError(f"Failed to get server config: {err}")
         return out
 
+    @staticmethod
+    def _sanitize_server_config(config_content):
+        """awg-quick chokes on a bare `DNS =` key in the server config (it calls
+        resolvconf, which is missing in the container, and the interface goes
+        down). Convert active `DNS = ...` lines into `# DNS = ...` comments:
+        the panel still reads them via _get_dns(), but quick-tools ignore them."""
+        lines = []
+        for line in config_content.split('\n'):
+            stripped = line.strip()
+            if stripped.startswith('DNS') and '=' in stripped and not stripped.startswith('#'):
+                indent = line[:len(line) - len(line.lstrip())]
+                lines.append(f"{indent}# {stripped}")
+            else:
+                lines.append(line)
+        return '\n'.join(lines)
+
     def save_server_config(self, protocol_type, config_content):
         """Save the server WireGuard config and restart container."""
+        config_content = self._sanitize_server_config(config_content)
         container_name = self._container_name(protocol_type)
         config_path = self._resolve_config_path(protocol_type)
 
@@ -900,28 +917,78 @@ tail -f /dev/null
         return ips
 
     def _get_next_ip(self, protocol_type):
-        """Calculate the next available IP for a new client."""
+        """Return the first free IP in the subnet, filling gaps left by deleted clients.
+
+        The old implementation took the last IP in file order and incremented it,
+        which produced duplicate IPs when peers were not sorted by IP and never
+        reused addresses freed by deleted clients.
+        """
         used_ips = self._get_used_ips(protocol_type)
-        if not used_ips:
-            base = self._get_subnet_base(protocol_type)
-            parts = base.split('.')
-            parts[3] = '2'
-            return '.'.join(parts)
+        base = self._get_subnet_base(protocol_type)
+        parts = base.split('.')
+        prefix = '.'.join(parts[:3])
 
-        # Get the last used IP and increment
-        last_ip = used_ips[-1]
-        parts = last_ip.split('.')
-        last_octet = int(parts[3])
+        used_octets = set()
+        for ip in used_ips:
+            ip_parts = ip.split('.')
+            if len(ip_parts) != 4 or '.'.join(ip_parts[:3]) != prefix:
+                continue
+            try:
+                used_octets.add(int(ip_parts[3]))
+            except ValueError:
+                continue
 
-        if last_octet == 254:
-            next_octet = last_octet + 3
-        elif last_octet == 255:
-            next_octet = last_octet + 2
-        else:
-            next_octet = last_octet + 1
+        for octet in range(2, 255):
+            if octet not in used_octets:
+                parts[3] = str(octet)
+                return '.'.join(parts)
 
-        parts[3] = str(next_octet)
-        return '.'.join(parts)
+        raise RuntimeError("No free IP addresses left in the subnet")
+
+    @staticmethod
+    def _peer_block_ip(block):
+        """Sort key for a [Peer] config block: its first AllowedIPs IPv4 address."""
+        match = re.search(r'AllowedIPs\s*=\s*(\d+)\.(\d+)\.(\d+)\.(\d+)', block)
+        if match:
+            return tuple(int(match.group(i)) for i in range(1, 5))
+        return (255, 255, 255, 255)
+
+    def _insert_peer_sorted(self, protocol_type, peer_section):
+        """Insert a new [Peer] section into the server config keeping peers sorted by IP.
+
+        Creates a timestamped backup of the config inside the container before
+        overwriting it, then rewrites the file with all [Peer] sections ordered
+        by their AllowedIPs address.
+        """
+        container_name = self._container_name(protocol_type)
+        config_path = self._resolve_config_path(protocol_type)
+
+        config = self._get_server_config(protocol_type)
+
+        # Backup current config inside the container before modifying it
+        ts = __import__('datetime').datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.ssh.run_sudo_command(
+            f"docker exec -i {container_name} cp {config_path} {config_path}.bak.{ts}"
+        )
+
+        head, _, rest = config.partition('[Peer]')
+        blocks = []
+        if rest:
+            for chunk in rest.split('[Peer]'):
+                chunk = chunk.strip()
+                if chunk:
+                    blocks.append('[Peer]\n' + chunk)
+
+        blocks.append(peer_section.strip())
+        blocks.sort(key=self._peer_block_ip)
+
+        new_config = head.rstrip('\n') + '\n\n' + '\n\n'.join(blocks) + '\n'
+
+        self.ssh.upload_file(new_config, "/tmp/_amnz_add_peer.conf")
+        self.ssh.run_sudo_command(
+            f"docker cp /tmp/_amnz_add_peer.conf {container_name}:{config_path}"
+        )
+        self.ssh.run_command("rm -f /tmp/_amnz_add_peer.conf")
 
     def _extract_ipv4(self, value):
         """Extract the first IPv4 address from AllowedIPs/clientIp-like values."""
@@ -1104,11 +1171,8 @@ PresharedKey = {psk}
 AllowedIPs = {allowed_ips}
 
 """
-        # Append peer to server config
-        escaped_peer = peer_section.replace("'", "'\\''")
-        self.ssh.run_sudo_command(
-            f"docker exec -i {container_name} bash -c 'echo \"{escaped_peer}\" >> {config_path}'"
-        )
+        # Insert peer into server config, keeping peers sorted by IP (with backup)
+        self._insert_peer_sorted(protocol_type, peer_section)
 
         # Sync config without restart
         self.ssh.run_sudo_command(
@@ -1138,22 +1202,16 @@ AllowedIPs = {allowed_ips}
         if awg_params.get('port'):
             port = awg_params['port']
 
-        dns1 = AWG_DEFAULTS['dns1']
-        dns2 = AWG_DEFAULTS['dns2']
-        
-        # Check if AmneziaDNS is installed
-        out, _, _ = self.ssh.run_sudo_command("docker ps -a --filter name=^amnezia-dns$ --format '{{.Names}}'")
-        if 'amnezia-dns' in out:
-            dns1 = '172.29.172.254'
-            
+        dns = self._get_dns(protocol_type)
+
         mtu = AWG_DEFAULTS['mtu']
 
         # Standard fields (dual-stack when the client has an IPv6 address)
         address_line = f"{client_ip}/32" + (f", {client_ipv6}/128" if client_ipv6 else "")
         dns_line = f"{dns1}, {dns2}" + (", 2606:4700:4700::1111" if client_ipv6 else "")
         config_lines = [
-            f"Address = {address_line}",
-            f"DNS = {dns_line}",
+            f"Address = {client_ip}/32",
+            f"DNS = {dns}",
             f"PrivateKey = {client_priv_key}",
             f"MTU = {mtu}"
         ]
@@ -1217,6 +1275,8 @@ PersistentKeepalive = 25
             raise RuntimeError(f"Client {client_id} not found")
 
         ud = client.get('userData', {})
+        if ud.get('customConfig'):
+            return ud['customConfig']
         client_priv_key = ud.get('clientPrivateKey', '')
         client_ip = ud.get('clientIp', '')
         psk = ud.get('psk', '')
@@ -1234,22 +1294,16 @@ PersistentKeepalive = 25
         if awg_params.get('port'):
             port = awg_params['port']
 
-        dns1 = AWG_DEFAULTS['dns1']
-        dns2 = AWG_DEFAULTS['dns2']
-        
-        # Check if AmneziaDNS is installed
-        out, _, _ = self.ssh.run_sudo_command("docker ps -a --filter name=^amnezia-dns$ --format '{{.Names}}'")
-        if 'amnezia-dns' in out:
-            dns1 = '172.29.172.254'
-            
+        dns = self._get_dns(protocol_type, ud)
+
         mtu = AWG_DEFAULTS['mtu']
 
         # Standard fields (dual-stack when the client has an IPv6 address)
         address_line = f"{client_ip}/32" + (f", {client_ipv6}/128" if client_ipv6 else "")
         dns_line = f"{dns1}, {dns2}" + (", 2606:4700:4700::1111" if client_ipv6 else "")
         config_lines = [
-            f"Address = {address_line}",
-            f"DNS = {dns_line}",
+            f"Address = {client_ip}/32",
+            f"DNS = {dns}",
             f"PrivateKey = {client_priv_key}",
             f"MTU = {mtu}"
         ]
@@ -1452,6 +1506,82 @@ AllowedIPs = {allowed_ips}
         self._save_clients_table(protocol_type, clients_table)
 
         return True
+
+    def _get_dns(self, protocol_type, user_data=None):
+        """DNS servers for generated client configs.
+
+        Priority: per-client override (userData.dns, set by saving an edited
+        config) > `DNS = ...` line in the server config (wg-quick-style key,
+        stripped by awg-quick so it does not affect syncconf) > AmneziaDNS
+        container address > built-in defaults.
+        """
+        if user_data and user_data.get('dns'):
+            return user_data['dns']
+        try:
+            server_config = self._get_server_config(protocol_type)
+            for line in server_config.split('\n'):
+                stripped = line.strip()
+                if stripped.startswith('#'):
+                    stripped = stripped.lstrip('#').strip()
+                if stripped.startswith('DNS') and '=' in stripped:
+                    return stripped.split('=', 1)[1].strip()
+        except Exception:
+            pass
+        dns1 = AWG_DEFAULTS['dns1']
+        dns2 = AWG_DEFAULTS['dns2']
+        out, _, _ = self.ssh.run_sudo_command("docker ps -a --filter name=^amnezia-dns$ --format '{{.Names}}'")
+        if 'amnezia-dns' in out:
+            dns1 = '172.29.172.254'
+        return f"{dns1}, {dns2}"
+
+    def save_client_config(self, protocol_type, client_id, config_text):
+        """Persist a manually edited client config. Stored verbatim in
+        clientsTable (userData.customConfig) and returned by get_client_config
+        from now on; the DNS line is indexed into userData.dns as the
+        per-client override for future regenerations."""
+        config_text = (config_text or '').strip()
+        if not config_text:
+            raise RuntimeError('Config is empty')
+        clients_table = self._get_clients_table(protocol_type)
+        client = next((c for c in clients_table if c.get('clientId') == client_id), None)
+        if client is None:
+            raise RuntimeError('Client not found')
+        ud = client.setdefault('userData', {})
+        ud['customConfig'] = config_text
+        ud.pop('dns', None)
+        for line in config_text.split('\n'):
+            stripped = line.strip()
+            if stripped.startswith('DNS') and '=' in stripped:
+                ud['dns'] = stripped.split('=', 1)[1].strip()
+                break
+        self._save_clients_table(protocol_type, clients_table)
+        return {'status': 'success'}
+
+    def rename_client(self, protocol_type, client_id, new_name):
+        """Rename a client. The name lives only in the clientsTable
+        (userData.clientName); keys, IPs and the WireGuard config itself
+        are untouched, so existing configs keep working."""
+        clients_table = self._get_clients_table(protocol_type)
+        client = next((c for c in clients_table if c.get('clientId') == client_id), None)
+        if client is None:
+            # Peer added via the native Amnezia app is not in the table yet —
+            # persist a minimal entry so the chosen name sticks.
+            conf_peers = self._parse_peers_from_config(protocol_type)
+            if client_id not in conf_peers:
+                raise RuntimeError('Client not found')
+            client = {
+                'clientId': client_id,
+                'userData': {
+                    'clientName': new_name,
+                    'clientPrivateKey': '',
+                    'externalClient': True,
+                }
+            }
+            clients_table.append(client)
+        else:
+            client.setdefault('userData', {})['clientName'] = new_name
+        self._save_clients_table(protocol_type, clients_table)
+        return {'status': 'success', 'name': new_name}
 
     def get_server_status(self, protocol_type):
         """Get detailed status of the AWG server."""
