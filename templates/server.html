@@ -584,6 +584,41 @@
                 <div class="form-hint" id="installPortHint">{{ _('port_default_hint') }}</div>
             </div>
 
+            <div id="awgOptions"
+                style="display:none; padding: var(--space-md); background: rgba(0,0,0,0.03); border-radius: var(--radius-md); margin-bottom: var(--space-md);">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label class="form-label">{{ _('awg_mtu') }}</label>
+                        <input class="form-input" type="number" id="installAwgMtu" value="1376" min="576" max="65535">
+                        <div class="form-hint">{{ _('awg_mtu_hint') }}</div>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">DNS 1</label>
+                        <input class="form-input" type="text" id="installAwgDns1" value="1.1.1.1">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">DNS 2</label>
+                        <input class="form-input" type="text" id="installAwgDns2" value="1.0.0.1">
+                    </div>
+                </div>
+                <div id="installAwgJunk">
+                    <div class="form-group">
+                        <label class="form-label" style="display:flex; justify-content:space-between; align-items:center;">
+                            {{ _('awg_special_junk') }}
+                            <button type="button" class="btn btn-secondary btn-sm"
+                                onclick="resetSpecialJunkFields('install')">{{ _('awg_special_junk_reset') }}</button>
+                        </label>
+                        <div class="form-hint" style="margin-bottom:var(--space-xs);">{{ _('awg_special_junk_hint') }}</div>
+                        <input class="form-input" type="text" id="installAwgI1" spellcheck="false" placeholder="I1">
+                        <input class="form-input mt-xs" type="text" id="installAwgI2" spellcheck="false" placeholder="I2">
+                        <input class="form-input mt-xs" type="text" id="installAwgI3" spellcheck="false" placeholder="I3">
+                        <input class="form-input mt-xs" type="text" id="installAwgI4" spellcheck="false" placeholder="I4">
+                        <input class="form-input mt-xs" type="text" id="installAwgI5" spellcheck="false" placeholder="I5">
+                        <div class="form-hint">{{ _('awg_special_junk_syntax') }}</div>
+                    </div>
+                </div>
+            </div>
+
             <div id="telemtOptions"
                 style="display:none; padding: var(--space-md); background: rgba(0,0,0,0.03); border-radius: var(--radius-md); margin-bottom: var(--space-md);">
                 <div class="form-group">
@@ -703,6 +738,53 @@
                     {{ _('done') }}
                 </button>
             </div>
+        </div>
+    </div>
+</div>
+
+<!-- ===== AmneziaWG Settings Modal ===== -->
+<div class="modal-backdrop" id="awgSettingsModal">
+    <div class="modal" style="max-width:640px;">
+        <div class="modal-header">
+            <h2 class="modal-title" id="awgSettingsTitle">{{ _('awg_settings_title') }}</h2>
+            <button class="modal-close" onclick="closeModal('awgSettingsModal')">×</button>
+        </div>
+        <div class="form-hint" style="margin-bottom:var(--space-md);">{{ _('awg_settings_desc') }}</div>
+        <div class="form-row">
+            <div class="form-group">
+                <label class="form-label">{{ _('awg_mtu') }}</label>
+                <input class="form-input" type="number" id="awgSetMtu" min="576" max="65535">
+                <div class="form-hint">{{ _('awg_mtu_hint') }}</div>
+            </div>
+            <div class="form-group">
+                <label class="form-label">DNS 1</label>
+                <input class="form-input" type="text" id="awgSetDns1">
+            </div>
+            <div class="form-group">
+                <label class="form-label">DNS 2</label>
+                <input class="form-input" type="text" id="awgSetDns2">
+            </div>
+        </div>
+        <div class="form-group" id="awgSetJunkGroup">
+            <label class="form-label" style="display:flex; justify-content:space-between; align-items:center;">
+                {{ _('awg_special_junk') }}
+                <button type="button" class="btn btn-secondary btn-sm"
+                    onclick="resetSpecialJunkFields('awgSet')">{{ _('awg_special_junk_reset') }}</button>
+            </label>
+            <div class="form-hint" style="margin-bottom:var(--space-xs);">{{ _('awg_special_junk_hint') }}</div>
+            <input class="form-input" type="text" id="awgSetI1" spellcheck="false" placeholder="I1">
+            <input class="form-input mt-xs" type="text" id="awgSetI2" spellcheck="false" placeholder="I2">
+            <input class="form-input mt-xs" type="text" id="awgSetI3" spellcheck="false" placeholder="I3">
+            <input class="form-input mt-xs" type="text" id="awgSetI4" spellcheck="false" placeholder="I4">
+            <input class="form-input mt-xs" type="text" id="awgSetI5" spellcheck="false" placeholder="I5">
+            <div class="form-hint">{{ _('awg_special_junk_syntax') }}</div>
+        </div>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeModal('awgSettingsModal')">{{ _('cancel') }}</button>
+            <button class="btn btn-primary" onclick="saveAwgSettings()" id="awgSaveBtn">
+                <span id="awgSaveBtnText">{{ _('save') }}</span>
+                <div class="spinner hidden" id="awgSaveSpinner"></div>
+            </button>
         </div>
     </div>
 </div>
@@ -987,6 +1069,23 @@
     let currentProtocolStatus = {};
     let installedAppsLoading = true;
     let currentSocks5Proto = 'socks5';
+    let currentAwgProto = 'awg2';
+
+    const AWG_PROTOCOLS = ['awg', 'awg2', 'awg3', 'awg_legacy'];
+    const SPECIAL_JUNK_KEYS = ['i1', 'i2', 'i3', 'i4', 'i5'];
+    // Same value the desktop client ships as its default I1.
+    const AWG_DEFAULT_I1 = '<r 2><b 0x858000010001000000000669636c6f756403636f6d0000010001c00c000100010000105a00044d583737>';
+
+    function specialJunkField(prefix, key) {
+        return document.getElementById(prefix + 'Awg' + key.toUpperCase());
+    }
+
+    function resetSpecialJunkFields(prefix) {
+        SPECIAL_JUNK_KEYS.forEach((key, idx) => {
+            const el = specialJunkField(prefix, key);
+            if (el) el.value = idx === 0 ? AWG_DEFAULT_I1 : '';
+        });
+    }
 
     function protoBase(proto) {
         return String(proto || 'awg').split('__')[0];
@@ -1553,7 +1652,11 @@
                         <button class="btn btn-danger btn-sm" onclick="toggleContainer('${proto}', true)" title="${_('stop_container_confirm').replace('{}', '')}">${_('stop_btn')}</button>
                     `;
                 } else {
+                    const awgBtn = AWG_PROTOCOLS.includes(protoBase(proto))
+                        ? `<button class="btn btn-secondary btn-sm" onclick="openAwgSettings('${proto}')" title="${_('awg_settings_title')}">${_('awg_settings_btn')}</button>`
+                        : '';
                     ctrlEl.innerHTML = `
+                        ${awgBtn}
                         <button class="btn btn-secondary btn-sm" onclick="showServerConfig('${proto}')" title="${_('server_config')}">${_('config_btn')}</button>
                         <button class="btn btn-danger btn-sm" onclick="toggleContainer('${proto}', true)" title="${_('stop_container_confirm').replace('{}', '')}">${_('stop_btn')}</button>
                     `;
@@ -1739,11 +1842,13 @@
         const socks5Opts = document.getElementById('socks5Options');
         const adguardOpts = document.getElementById('adguardOptions');
         const nginxOpts = document.getElementById('nginxOptions');
+        const awgOpts = document.getElementById('awgOptions');
 
         telemtOpts.style.display = 'none';
         socks5Opts.style.display = 'none';
         adguardOpts.style.display = 'none';
         nginxOpts.style.display = 'none';
+        awgOpts.style.display = 'none';
 
         if (base === 'dns') {
             portLabel.textContent = _('port') + ' (Internal)';
@@ -1785,6 +1890,13 @@
             portInput.value = currentInstallAnother ? nextSuggestedPort(currentInstallProto, 55424) : '55424';
             portInput.disabled = false;
             portHint.textContent = currentInstallAnother ? _('port_next_instance_hint') : _('port_default_hint');
+            awgOpts.style.display = 'block';
+            // AWG Legacy predates the special junk packets, only MTU/DNS apply.
+            document.getElementById('installAwgJunk').style.display = base === 'awg_legacy' ? 'none' : '';
+            document.getElementById('installAwgMtu').value = '1376';
+            document.getElementById('installAwgDns1').value = '1.1.1.1';
+            document.getElementById('installAwgDns2').value = '1.0.0.1';
+            resetSpecialJunkFields('install');
         }
 
         document.getElementById('installForm').classList.remove('hidden');
@@ -1846,6 +1958,15 @@
             } else if (protoBase(currentInstallProto) === 'nginx') {
                 params.nginx_domain = document.getElementById('installNginxDomain').value.trim();
                 params.nginx_email = document.getElementById('installNginxEmail').value.trim();
+            } else if (AWG_PROTOCOLS.includes(protoBase(currentInstallProto))) {
+                params.awg_mtu = document.getElementById('installAwgMtu').value.trim();
+                params.awg_dns1 = document.getElementById('installAwgDns1').value.trim();
+                params.awg_dns2 = document.getElementById('installAwgDns2').value.trim();
+                if (protoBase(currentInstallProto) !== 'awg_legacy') {
+                    ['i1', 'i2', 'i3', 'i4', 'i5'].forEach(key => {
+                        params['awg_' + key] = document.getElementById('installAwg' + key.toUpperCase()).value.trim();
+                    });
+                }
             }
             const result = await apiCall(`/api/servers/${SERVER_ID}/install`, 'POST', params);
             clearInterval(progressInterval);
@@ -1976,6 +2097,57 @@
     }
 
     // ========== SOCKS5 Settings ==========
+    async function openAwgSettings(proto) {
+        currentAwgProto = proto;
+        try {
+            const data = await apiCall(`/api/servers/${SERVER_ID}/awg/settings`, 'POST', { protocol: proto });
+            document.getElementById('awgSettingsTitle').textContent = `${_('awg_settings_title')} — ${getProtoTitle(proto)}`;
+            document.getElementById('awgSetMtu').value = data.mtu || '1376';
+            document.getElementById('awgSetDns1').value = data.dns1 || '';
+            document.getElementById('awgSetDns2').value = data.dns2 || '';
+            const junkGroup = document.getElementById('awgSetJunkGroup');
+            junkGroup.style.display = data.supports_special_junk ? '' : 'none';
+            SPECIAL_JUNK_KEYS.forEach(key => {
+                const el = specialJunkField('awgSet', key);
+                if (el) el.value = data[key] || '';
+            });
+            openModal('awgSettingsModal');
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        }
+    }
+
+    async function saveAwgSettings() {
+        const btn = document.getElementById('awgSaveBtn');
+        const text = document.getElementById('awgSaveBtnText');
+        const spinner = document.getElementById('awgSaveSpinner');
+        const payload = {
+            protocol: currentAwgProto,
+            mtu: document.getElementById('awgSetMtu').value.trim(),
+            dns1: document.getElementById('awgSetDns1').value.trim(),
+            dns2: document.getElementById('awgSetDns2').value.trim(),
+        };
+        if (document.getElementById('awgSetJunkGroup').style.display !== 'none') {
+            SPECIAL_JUNK_KEYS.forEach(key => {
+                payload[key] = specialJunkField('awgSet', key).value.trim();
+            });
+        }
+        btn.disabled = true;
+        text.textContent = _('saving') || 'Saving...';
+        spinner.classList.remove('hidden');
+        try {
+            await apiCall(`/api/servers/${SERVER_ID}/awg/settings/save`, 'POST', payload);
+            showToast(_('awg_settings_saved'), 'success');
+            closeModal('awgSettingsModal');
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        } finally {
+            btn.disabled = false;
+            text.textContent = _('save');
+            spinner.classList.add('hidden');
+        }
+    }
+
     async function openSocks5Settings(proto = 'socks5') {
         currentSocks5Proto = proto || 'socks5';
         try {

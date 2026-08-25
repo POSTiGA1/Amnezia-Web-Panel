@@ -1497,6 +1497,10 @@ a:hover {
     gap: var(--space-md);
 }
 
+.mt-xs {
+    margin-top: var(--space-xs);
+}
+
 .mt-md {
     margin-top: var(--space-md);
 }
