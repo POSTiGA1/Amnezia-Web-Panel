@@ -304,6 +304,15 @@ class TestUserDeleteConnection(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('Delete connection', text)
         self.assertNotIn('This cannot be undone', text)
 
+    async def test_user_delete_confirmation_cancel_button_keeps_cross_icon(self):
+        ref_key = tg_bot._ref('user_delete', {'conn_id': 'conn-1', 'name': 'MyPhone'})
+        msg = _callback_update(chat_id=111, from_id=111, data_str=ref_key, language_code='ru')
+        await _dispatch_callback_with_service(self.api, msg, self.load_data, self.mock_service)
+        reply_markup = self.api.edit_message.call_args[1].get('reply_markup', {})
+        buttons = [btn for row in reply_markup.get('inline_keyboard', []) for btn in row]
+        cancel_button = next(btn for btn in buttons if btn.get('callback_data') == 'refresh')
+        self.assertEqual(cancel_button['text'], '❌ Отмена')
+
     async def test_user_delete_success_uses_russian_when_telegram_language_is_ru(self):
         async def delete_connection(user_id, conn_id, source):
             self.data['user_connections'] = [c for c in self.data['user_connections'] if c['id'] != conn_id]
