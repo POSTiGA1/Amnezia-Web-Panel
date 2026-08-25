@@ -1037,8 +1037,16 @@ def awg_special_junk_from(req):
 
 
 def generate_vpn_link(config_text):
-    b64 = base64.b64encode(config_text.strip().encode('utf-8')).decode('utf-8')
-    return f"vpn://{b64}"
+    """Encode a config as a vpn:// key.
+
+    Amnezia decodes with QByteArray::Base64UrlEncoding|OmitTrailingEquals,
+    and Qt silently *skips* characters outside that alphabet instead of
+    failing. Standard base64 therefore corrupts the payload as soon as it
+    emits '+' or '/' -- which a config containing '>' or '?' does, the
+    default I1 packet among them.
+    """
+    b64 = base64.urlsafe_b64encode(config_text.strip().encode('utf-8')).decode('utf-8')
+    return f"vpn://{b64.rstrip('=')}"
 
 
 # ===================== API tokens =====================
