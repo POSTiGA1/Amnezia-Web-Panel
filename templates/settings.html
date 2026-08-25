@@ -549,6 +549,10 @@
         document.getElementById('sslFields').style.display = e.target.checked ? 'block' : 'none';
     });
 
+    document.getElementById('ss_enabled').addEventListener('change', (e) => {
+        document.getElementById('selfServiceFields').style.display = e.target.checked ? 'block' : 'none';
+    });
+
     let tunnelStatusTimer = null;
 
     function copyElementText(id) {
@@ -845,11 +849,24 @@
             interval_hours: parseInt(autoBackupForm.interval_hours.value || '24')
         };
 
+        const self_service = {
+            enabled: document.getElementById('ss_enabled').checked,
+            web_enabled: document.getElementById('ss_web_enabled').checked,
+            telegram_enabled: document.getElementById('ss_telegram_enabled').checked,
+            max_connections_per_user: parseInt(document.getElementById('ss_max_connections').value || '5'),
+            rate_limit_count: parseInt(document.getElementById('ss_rate_limit').value || '3'),
+            rate_limit_window_seconds: parseInt(document.getElementById('ss_rate_window').value || '60'),
+            allowed_protocols: [
+                ...(document.getElementById('ss_proto_awg').checked ? ['awg'] : []),
+                ...(document.getElementById('ss_proto_awg2').checked ? ['awg2'] : []),
+            ],
+        };
+
         try {
             const res = await fetch('/api/settings/save', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ appearance, sync, captcha, telegram, ssl, auto_backup })
+                body: JSON.stringify({ appearance, sync, captcha, telegram, ssl, auto_backup, self_service })
             });
             if (!res.ok) throw new Error(_('error'));
             showToast(_('settings_saved'), 'success');
