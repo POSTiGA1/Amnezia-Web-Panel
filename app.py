@@ -38,7 +38,7 @@ except ImportError:
     CaptchaGenerator = None
 
 from managers.ssh_manager import SSHManager
-from managers.awg_manager import AWGManager
+from managers.awg_manager import AWGManager, normalize_special_junk
 from managers.xray_manager import XrayManager
 from managers.wireguard_manager import WireGuardManager
 from managers.backup_manager import BackupManager
@@ -1012,6 +1012,30 @@ def _manager_call(manager, method, protocol, *args, **kwargs):
     return fn(protocol, *args, **kwargs)
 
 
+AWG_PROTOCOLS = ('awg', 'awg2', 'awg3', 'awg_legacy')
+
+
+def join_dns(dns1, dns2):
+    """Join the two DNS fields into the `a, b` form used in configs."""
+    parts = [str(value).strip() for value in (dns1, dns2) if value and str(value).strip()]
+    return ', '.join(parts) or None
+
+
+def split_dns(dns):
+    """Split a stored `a, b` DNS string back into two form fields."""
+    parts = [part.strip() for part in str(dns or '').split(',') if part.strip()]
+    parts += [''] * (2 - len(parts))
+    return parts[0], parts[1]
+
+
+def awg_special_junk_from(req):
+    """Collect I1-I5 from a request, or None when the form sent none of them."""
+    values = {key: getattr(req, f'awg_{key}', None) for key in ('i1', 'i2', 'i3', 'i4', 'i5')}
+    if all(value is None for value in values.values()):
+        return None
+    return values
+
+
 def generate_vpn_link(config_text):
     b64 = base64.b64encode(config_text.strip().encode('utf-8')).decode('utf-8')
     return f"vpn://{b64}"
@@ -1467,6 +1491,27 @@ class InstallProtocolRequest(BaseModel):
     # NGINX
     nginx_domain: Optional[str] = None
     nginx_email: Optional[str] = None
+    # AmneziaWG: values that end up in the generated client configs
+    awg_mtu: Optional[str] = None
+    awg_dns1: Optional[str] = None
+    awg_dns2: Optional[str] = None
+    awg_i1: Optional[str] = None
+    awg_i2: Optional[str] = None
+    awg_i3: Optional[str] = None
+    awg_i4: Optional[str] = None
+    awg_i5: Optional[str] = None
+
+
+class AwgSettingsRequest(BaseModel):
+    protocol: str = 'awg2'
+    mtu: Optional[str] = None
+    dns1: Optional[str] = None
+    dns2: Optional[str] = None
+    i1: Optional[str] = None
+    i2: Optional[str] = None
+    i3: Optional[str] = None
+    i4: Optional[str] = None
+    i5: Optional[str] = None
 
 
 class Socks5SettingsRequest(BaseModel):
@@ -2474,6 +2519,14 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
             install_protocol = req.protocol
         install_base = protocol_base(install_protocol)
 
+        awg_special_junk = awg_special_junk_from(req) if install_base in AWG_PROTOCOLS else None
+        if awg_special_junk is not None:
+            # Reject a malformed packet before touching the server.
+            try:
+                normalize_special_junk(awg_special_junk)
+            except ValueError as e:
+                return JSONResponse({'error': str(e)}, status_code=400)
+
         ssh = get_ssh(server)
         ssh.connect()
         docker_install_log = ensure_docker_installed(ssh)
@@ -2519,6 +2572,14 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
                 domain=req.nginx_domain,
                 email=req.nginx_email,
             )
+        elif install_base in AWG_PROTOCOLS:
+            result = manager.install_protocol(
+                install_protocol,
+                port=req.port,
+                mtu=req.awg_mtu,
+                dns=join_dns(req.awg_dns1, req.awg_dns2),
+                special_junk=awg_special_junk,
+            )
         else:
             result = manager.install_protocol(install_protocol, port=req.port)
 
@@ -2536,6 +2597,10 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
             'port': req.port,
             'awg_params': result.get('awg_params', {}),
         }
+        if result.get('mtu'):
+            proto_record['mtu'] = result['mtu']
+        if result.get('dns'):
+            proto_record['dns'] = result['dns']
         if install_base == 'adguard':
             proto_record['mode'] = result.get('mode')
             proto_record['internal_ip'] = result.get('internal_ip')
@@ -2617,6 +2682,74 @@ async def api_socks5_update_credentials(request: Request, server_id: int, req: S
         return result
     except Exception as e:
         logger.exception("Error updating SOCKS5 credentials")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/awg/settings', tags=["Protocols"])
+async def api_awg_settings_get(request: Request, server_id: int, req: ProtocolRequest):
+    """Return MTU, DNS and the special junk packets I1-I5 of an AWG server."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if protocol_base(req.protocol) not in AWG_PROTOCOLS:
+        return JSONResponse({'error': 'Not an AmneziaWG protocol'}, status_code=400)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        ssh = get_ssh(data['servers'][server_id])
+        ssh.connect()
+        try:
+            settings = AWGManager(ssh).get_awg_settings(req.protocol)
+        finally:
+            ssh.disconnect()
+        settings['dns1'], settings['dns2'] = split_dns(settings.get('dns'))
+        return settings
+    except Exception as e:
+        logger.exception("Error getting AWG settings")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/awg/settings/save', tags=["Protocols"])
+async def api_awg_settings_save(request: Request, server_id: int, req: AwgSettingsRequest):
+    """Update MTU, DNS and I1-I5 and apply them to the running interface."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if protocol_base(req.protocol) not in AWG_PROTOCOLS:
+        return JSONResponse({'error': 'Not an AmneziaWG protocol'}, status_code=400)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        special_junk = {key: getattr(req, key) for key in ('i1', 'i2', 'i3', 'i4', 'i5')}
+        if all(value is None for value in special_junk.values()):
+            special_junk = None
+        else:
+            # Reject a malformed packet before opening an SSH connection.
+            normalize_special_junk(special_junk)
+        ssh = get_ssh(server)
+        ssh.connect()
+        try:
+            settings = AWGManager(ssh).update_awg_settings(
+                req.protocol,
+                mtu=req.mtu,
+                dns=join_dns(req.dns1, req.dns2),
+                special_junk=special_junk,
+            )
+        finally:
+            ssh.disconnect()
+        proto_record = server.setdefault('protocols', {}).get(req.protocol)
+        if proto_record is not None:
+            proto_record['mtu'] = settings.get('mtu')
+            proto_record['dns'] = settings.get('dns')
+            save_data(data)
+        settings['dns1'], settings['dns2'] = split_dns(settings.get('dns'))
+        settings['status'] = 'success'
+        return settings
+    except ValueError as e:
+        return JSONResponse({'error': str(e)}, status_code=400)
+    except Exception as e:
+        logger.exception("Error saving AWG settings")
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
