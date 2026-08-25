@@ -44,6 +44,13 @@ from managers.wireguard_manager import WireGuardManager
 from managers.backup_manager import BackupManager
 import telegram_bot as tg_bot
 
+from connection_service import (
+    ConnectionService,
+    DEFAULT_SELF_SERVICE_SETTINGS,
+    RateLimitError,
+    SelfServiceError,
+)
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -196,6 +203,11 @@ def load_data():
         'last_created_count': 0,
         'last_error': None
     })
+    self_service = data['settings'].setdefault('self_service', dict(DEFAULT_SELF_SERVICE_SETTINGS))
+    for key, value in DEFAULT_SELF_SERVICE_SETTINGS.items():
+        self_service.setdefault(key, value)
+    for server in data.get('servers', []):
+        server.setdefault('self_service_enabled', False)
     return data
 
 
@@ -1035,6 +1047,17 @@ def generate_vpn_link(config_text):
     return f"vpn://{b64}"
 
 
+self_service_connections = ConnectionService(
+    load_data=load_data,
+    save_data=save_data,
+    data_lock=DATA_LOCK,
+    get_ssh=get_ssh,
+    get_protocol_manager=get_protocol_manager,
+    manager_call=_manager_call,
+    generate_vpn_link=generate_vpn_link,
+)
+
+
 # ===================== API tokens =====================
 
 API_TOKEN_PREFIX = 'awp_'  # "Amnezia Web Panel" — makes tokens visually distinct in logs / configs
@@ -1456,6 +1479,7 @@ class EditServerRequest(BaseModel):
     # fields can be omitted to keep current auth unchanged.
     password: Optional[str] = None
     private_key: Optional[str] = None
+    self_service_enabled: Optional[bool] = None
 
 
 class ReorderServersRequest(BaseModel):
@@ -1618,6 +1642,22 @@ class AutoBackupSettings(BaseModel):
     interval_hours: int = 24
 
 
+class SelfServiceSettings(BaseModel):
+    enabled: bool = False
+    web_enabled: bool = True
+    telegram_enabled: bool = True
+    max_connections_per_user: int = 5
+    rate_limit_count: int = 3
+    rate_limit_window_seconds: int = 60
+    allowed_protocols: List[str] = ['awg', 'awg2']
+
+
+class SelfServiceConnectionRequest(BaseModel):
+    server_id: int
+    protocol: str = 'awg'
+    name: str = 'VPN Connection'
+
+
 
 
 class UpdateUserRequest(BaseModel):
@@ -1638,6 +1678,7 @@ class SaveSettingsRequest(BaseModel):
     telegram: TelegramSettings
     ssl: SSLSettings
     auto_backup: AutoBackupSettings = AutoBackupSettings()
+    self_service: SelfServiceSettings = SelfServiceSettings()
 
 
 class ToggleUserRequest(BaseModel):
@@ -1760,7 +1801,7 @@ async def startup():
     tg_cfg = data.get('settings', {}).get('telegram', {})
     if tg_cfg.get('enabled') and tg_cfg.get('token'):
         logger.info("Starting Telegram bot from saved settings...")
-        tg_bot.launch_bot(tg_cfg['token'], load_data, generate_vpn_link, save_data)
+        tg_bot.launch_bot(tg_cfg['token'], load_data, generate_vpn_link, save_data, self_service_svc=self_service_connections)
 
 
 def _auto_backup_due(auto_backup: dict, now: Optional[datetime] = None) -> bool:
@@ -2245,6 +2286,8 @@ async def api_edit_server(request: Request, server_id: int, req: EditServerReque
         server['password'] = new_pass
         server['private_key'] = new_key
         server['server_info'] = server_info
+        if req.self_service_enabled is not None:
+            server['self_service_enabled'] = bool(req.self_service_enabled)
         save_data(data)
         return {'status': 'success', 'server_info': server_info}
     except Exception as e:
@@ -3698,6 +3741,50 @@ async def api_my_connections(request: Request):
     return {'connections': conns}
 
 
+@app.get('/api/my/connections/options', tags=["Self-service"])
+async def api_my_connection_options(request: Request):
+    user = get_current_user(request)
+    if not user:
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await self_service_connections.get_self_service_options(user['id'], 'web')
+    except SelfServiceError as e:
+        return JSONResponse({'error': str(e)}, status_code=e.status_code)
+    except Exception as e:
+        logger.exception("Error getting self-service options")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/my/connections/add', tags=["Self-service"])
+async def api_my_connection_add(request: Request, payload: SelfServiceConnectionRequest):
+    user = get_current_user(request)
+    if not user:
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await self_service_connections.create_user_connection(
+            user['id'], payload.server_id, payload.protocol, payload.name, 'web'
+        )
+    except SelfServiceError as e:
+        return JSONResponse({'error': str(e)}, status_code=e.status_code)
+    except Exception as e:
+        logger.exception("Error creating self-service connection")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/my/connections/{connection_id}/delete', tags=["Self-service"])
+async def api_my_connection_delete(request: Request, connection_id: str):
+    user = get_current_user(request)
+    if not user:
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await self_service_connections.delete_user_connection(user['id'], connection_id, 'web')
+    except SelfServiceError as e:
+        return JSONResponse({'error': str(e)}, status_code=e.status_code)
+    except Exception as e:
+        logger.exception("Error deleting self-service connection")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
 @app.post('/api/users/{user_id}/share/setup', tags=["Users"])
 async def api_user_share_setup(user_id: str, req: ShareSetupRequest, request: Request):
     if not _check_admin(request):
@@ -3985,6 +4072,7 @@ async def save_settings(request: Request, payload: SaveSettingsRequest):
         'last_created_count': old_auto_backup.get('last_created_count', 0),
         'last_error': old_auto_backup.get('last_error')
     }
+    settings['self_service'] = payload.self_service.dict()
     save_data(data)
     logger.info("Settings saved (including captcha, telegram and auto backup)")
 
@@ -3993,7 +4081,7 @@ async def save_settings(request: Request, payload: SaveSettingsRequest):
     if tg_cfg.enabled and tg_cfg.token:
         if not tg_bot.is_running():
             logger.info("Starting Telegram bot (settings save)...")
-            tg_bot.launch_bot(tg_cfg.token, load_data, generate_vpn_link, save_data)
+            tg_bot.launch_bot(tg_cfg.token, load_data, generate_vpn_link, save_data, self_service_svc=self_service_connections)
     else:
         if tg_bot.is_running():
             logger.info("Stopping Telegram bot (settings save)...")
@@ -4020,7 +4108,7 @@ async def api_telegram_toggle(request: Request):
         save_data(data)
         return {'status': 'stopped', 'bot_running': False}
     else:
-        tg_bot.launch_bot(token, load_data, generate_vpn_link, save_data)
+        tg_bot.launch_bot(token, load_data, generate_vpn_link, save_data, self_service_svc=self_service_connections)
         tg_cfg['enabled'] = True
         data['settings']['telegram'] = tg_cfg
         save_data(data)
