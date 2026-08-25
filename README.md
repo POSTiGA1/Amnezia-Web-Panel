@@ -176,6 +176,16 @@ Mac
 
 https://hub.docker.com/r/prvtpro/amnezia-panel
 
+Images are also published to GitHub Container Registry on every push to `main` and on every `v*` tag:
+
+```bash
+# Panel
+docker pull ghcr.io/prvtpro/amnezia-panel:latest
+
+# Panel with Cloudflare WARP inside the container
+docker pull ghcr.io/prvtpro/amnezia-panel:latest-warp
+```
+
 
 ### Initial Login
 *   **Username**: `admin`
