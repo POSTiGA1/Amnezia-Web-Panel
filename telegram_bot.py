@@ -364,7 +364,7 @@ def _get_eligible_servers(data: dict, allowed_protocols: Optional[set] = None) -
     return eligible
 
 
-def _build_connections_keyboard(conns: list, data: dict) -> dict:
+def _build_connections_keyboard(conns: list, data: dict, lang: str = "en") -> dict:
     """Build inline keyboard where each button = one connection.
     When self-service is enabled, adds delete buttons for self-service connections
     and a 'Create connection' button."""
@@ -385,8 +385,8 @@ def _build_connections_keyboard(conns: list, data: dict) -> dict:
             row.append({"text": "🗑", "callback_data": _ref("user_delete", {"conn_id": c["id"], "name": name})})
         rows.append(row)
     if ss_enabled:
-        rows.append([{"text": "➕ Create connection", "callback_data": "user_create"}])
-    rows.append([{"text": "🔄 Refresh list", "callback_data": "refresh"}])
+        rows.append([{"text": f"➕ {_tt(lang, 'btn_create_connection')}", "callback_data": "user_create"}])
+    rows.append([{"text": f"🔄 {_tt(lang, 'btn_refresh_list')}", "callback_data": "refresh"}])
     return {"inline_keyboard": rows}
 
 
@@ -438,13 +438,13 @@ def _assign_user_keyboard(data: dict, server_id: int, proto: str, name: str) -> 
     return {"inline_keyboard": rows}
 
 
-def _admin_main_keyboard() -> dict:
+def _admin_main_keyboard(lang: str = "en") -> dict:
     return {
         "inline_keyboard": [
-            [{"text": "🖥 Servers", "callback_data": "adm:servers"}],
-            [{"text": "👤 Users", "callback_data": "adm:users"}],
-            [{"text": "🔐 My connections", "callback_data": "adm:myconns"}],
-            [{"text": "➕ How to add a server", "callback_data": "adm:addserver_help"}],
+            [{"text": f"🖥 {_tt(lang, 'btn_servers')}", "callback_data": "adm:servers"}],
+            [{"text": f"👤 {_tt(lang, 'btn_users')}", "callback_data": "adm:users"}],
+            [{"text": f"🔐 {_tt(lang, 'btn_my_connections')}", "callback_data": "adm:myconns"}],
+            [{"text": f"➕ {_tt(lang, 'btn_how_add_server')}", "callback_data": "adm:addserver_help"}],
         ]
     }
 
@@ -624,60 +624,61 @@ async def _handle_start(api: TelegramAPI, msg: dict, load_data_fn: Callable):
     tg_id = str(msg["from"]["id"])
     tg_username = msg["from"].get("username")
     first_name = msg["from"].get("first_name", "")
+    lang = _tg_lang(msg["from"])
 
     panel_user = _find_user(load_data_fn, tg_id, tg_username)
 
     if not panel_user:
         await api.send_message(
             chat_id,
-            f"👋 Hi, <b>{_e(first_name)}</b>!\n\n"
-            "Your Telegram account is not linked to any panel user.\n"
-            "Please contact your administrator — they need to add your Telegram ID to your profile.\n\n"
-            f"Your Telegram ID: <code>{_e(tg_id)}</code>",
+            f"👋 {_tt(lang, 'hi')}, <b>{_e(first_name)}</b>!\n\n"
+            f"{_tt(lang, 'account_not_linked')}\n"
+            f"{_tt(lang, 'contact_admin_to_link')}\n\n"
+            f"{_tt(lang, 'your_telegram_id')}: <code>{_e(tg_id)}</code>",
         )
         return
 
     if _is_admin(panel_user):
         await api.send_message(
             chat_id,
-            f"👋 Hi, <b>{_e(first_name)}</b>!\n\n"
-            f"You are registered as <b>{_e(panel_user.get('username'))}</b> with <b>Admin</b> role.\n"
-            "Choose an action:",
-            reply_markup=_admin_main_keyboard(),
+            f"👋 {_tt(lang, 'hi')}, <b>{_e(first_name)}</b>!\n\n"
+            f"{_tt(lang, 'registered_admin', username=_e(panel_user.get('username')))}\n"
+            f"{_tt(lang, 'choose_action')}",
+            reply_markup=_admin_main_keyboard(lang),
         )
         return
 
-    await _send_user_connections(api, chat_id, panel_user, load_data_fn, first_name=first_name)
+    await _send_user_connections(api, chat_id, panel_user, load_data_fn, first_name=first_name, lang=lang)
 
 
-async def _send_user_connections(api: TelegramAPI, chat_id: int, panel_user: dict, load_data_fn: Callable, first_name: str = ""):
+async def _send_user_connections(api: TelegramAPI, chat_id: int, panel_user: dict, load_data_fn: Callable, first_name: str = "", lang: str = "en"):
     data = load_data_fn()
     conns = [c for c in data.get("user_connections", []) if c.get("user_id") == panel_user.get("id")]
 
     if not conns:
-        greeting = f"👋 Hi, <b>{_e(first_name)}</b>!\n\n" if first_name else ""
+        greeting = f"👋 {_tt(lang, 'hi')}, <b>{_e(first_name)}</b>!\n\n" if first_name else ""
         if _self_service_telegram_enabled(data):
-            kb = _build_connections_keyboard(conns, data)
+            kb = _build_connections_keyboard(conns, data, lang)
             await api.send_message(
                 chat_id,
-                greeting + f"You are registered as <b>{_e(panel_user.get('username'))}</b>.\n\n"
-                "You have no connections yet. Create one below!",
+                greeting + f"{_tt(lang, 'registered_as', username=_e(panel_user.get('username')))}.\n\n"
+                f"{_tt(lang, 'no_connections_create')}",
                 reply_markup=kb,
             )
         else:
             await api.send_message(
                 chat_id,
-                greeting + f"You are registered as <b>{_e(panel_user.get('username'))}</b>.\n\n"
-                "You have no connections yet. Please contact your administrator.",
+                greeting + f"{_tt(lang, 'registered_as', username=_e(panel_user.get('username')))}.\n\n"
+                f"{_tt(lang, 'no_connections_contact_admin')}",
             )
         return
 
-    kb = _build_connections_keyboard(conns, data)
-    greeting = f"👋 Hi, <b>{_e(first_name)}</b>!\n\n" if first_name else ""
+    kb = _build_connections_keyboard(conns, data, lang)
+    greeting = f"👋 {_tt(lang, 'hi')}, <b>{_e(first_name)}</b>!\n\n" if first_name else ""
     await api.send_message(
         chat_id,
-        greeting + f"You are registered as <b>{_e(panel_user.get('username'))}</b>.\n\n"
-        f"<b>Your connections</b> ({len(conns)}) — tap to get config:",
+        greeting + f"{_tt(lang, 'registered_as', username=_e(panel_user.get('username')))}.\n\n"
+        f"{_tt(lang, 'your_connections', count=len(conns))}",
         reply_markup=kb,
     )
 
@@ -1226,7 +1227,7 @@ async def _handle_pending_input(api: TelegramAPI, msg: dict, load_data_fn: Calla
 # ----------------------------------------------------------------------- #
 #  Self-service user create wizard
 # ----------------------------------------------------------------------- #
-async def _user_create_start(api: TelegramAPI, chat_id: int, message_id: int, callback_id: str, tg_id: str, tg_username: Optional[str], load_data_fn: Callable, self_service_svc):
+async def _user_create_start(api: TelegramAPI, chat_id: int, message_id: int, callback_id: str, tg_id: str, tg_username: Optional[str], load_data_fn: Callable, self_service_svc, lang: str = "en"):
     panel_user = _find_user(load_data_fn, tg_id, tg_username)
     if not panel_user:
         await api.answer_callback(callback_id, text="Access denied")
@@ -1239,7 +1240,7 @@ async def _user_create_start(api: TelegramAPI, chat_id: int, message_id: int, ca
         await api.edit_message(
             chat_id,
             message_id,
-            "Self-service connection creation is disabled. Contact your administrator.",
+            _tt(lang, "self_service_disabled_contact"),
         )
         return
 
@@ -1249,7 +1250,7 @@ async def _user_create_start(api: TelegramAPI, chat_id: int, message_id: int, ca
         await api.edit_message(
             chat_id,
             message_id,
-            "No servers are available for self-service. Contact your administrator.",
+            _tt(lang, "self_service_no_servers"),
         )
         return
 
@@ -1260,12 +1261,12 @@ async def _user_create_start(api: TelegramAPI, chat_id: int, message_id: int, ca
         name = server.get("name") or server.get("host") or f"Server {sid + 1}"
         proto_text = ", ".join(_protocol_display_name(p) for p in protos)
         rows.append([{"text": f"🖥 {name} ({proto_text})", "callback_data": _ref("user_create_server", {"sid": sid})}])
-    rows.append([{"text": "❌ Cancel", "callback_data": "user_create_cancel"}])
+    rows.append([{"text": f"❌ {_tt(lang, 'btn_cancel')}", "callback_data": "user_create_cancel"}])
 
     await api.edit_message(
         chat_id,
         message_id,
-        f"➕ <b>Create connection</b>\n\nChoose a server:",
+        f"➕ <b>{_tt(lang, 'btn_create_connection')}</b>\n\n{_tt(lang, 'choose_server')}",
         reply_markup={"inline_keyboard": rows},
     )
 
@@ -1314,7 +1315,7 @@ async def _user_create_server(api: TelegramAPI, chat_id: int, message_id: int, c
     )
 
 
-async def _user_create_protocol(api: TelegramAPI, chat_id: int, message_id: int, callback_id: str, tg_id: str, tg_username: Optional[str], server_id: int, proto: str, load_data_fn: Callable):
+async def _user_create_protocol(api: TelegramAPI, chat_id: int, message_id: int, callback_id: str, tg_id: str, tg_username: Optional[str], server_id: int, proto: str, load_data_fn: Callable, lang: str = "en"):
     panel_user = _find_user(load_data_fn, tg_id, tg_username)
     if not panel_user:
         await api.answer_callback(callback_id, text="Access denied")
@@ -1333,12 +1334,12 @@ async def _user_create_protocol(api: TelegramAPI, chat_id: int, message_id: int,
     await api.edit_message(
         chat_id,
         message_id,
-        f"➕ <b>Create connection</b>\n\n"
-        f"Protocol: <b>{_e(_protocol_display_name(proto))}</b>\n\n"
-        f"Send a name for your device in the next message.\n"
-        f"Example: <code>Ivan iPhone</code>\n\n"
+        f"➕ <b>{_tt(lang, 'btn_create_connection')}</b>\n\n"
+        f"{_tt(lang, 'protocol_label')}: <b>{_e(_protocol_display_name(proto))}</b>\n\n"
+        f"{_tt(lang, 'send_device_name')}\n"
+        f"{_tt(lang, 'example_label')}: <code>Ivan iPhone</code>\n\n"
         f"Send <code>/cancel</code> to cancel.",
-        reply_markup={"inline_keyboard": [[{"text": "❌ Cancel", "callback_data": "user_create_cancel"}]]},
+        reply_markup={"inline_keyboard": [[{"text": f"❌ {_tt(lang, 'btn_cancel')}", "callback_data": "user_create_cancel"}]]},
     )
 
 
@@ -1353,7 +1354,7 @@ async def _user_create_cancel(api: TelegramAPI, chat_id: int, message_id: int, c
     await _send_user_connections(api, chat_id, panel_user, load_data_fn)
 
 
-async def _user_delete(api: TelegramAPI, chat_id: int, message_id: int, callback_id: str, tg_id: str, tg_username: Optional[str], conn_id: str, name: str, load_data_fn: Callable):
+async def _user_delete(api: TelegramAPI, chat_id: int, message_id: int, callback_id: str, tg_id: str, tg_username: Optional[str], conn_id: str, name: str, load_data_fn: Callable, lang: str = "en"):
     panel_user = _find_user(load_data_fn, tg_id, tg_username)
     if not panel_user:
         await api.answer_callback(callback_id, text="Access denied")
@@ -1364,7 +1365,7 @@ async def _user_delete(api: TelegramAPI, chat_id: int, message_id: int, callback
 
     data = load_data_fn()
     if not _self_service_telegram_enabled(data):
-        await api.edit_message(chat_id, message_id, "Self-service is disabled. Contact your administrator.")
+        await api.edit_message(chat_id, message_id, _tt(lang, "self_service_disabled_contact"))
         return
 
     conn = next((c for c in data.get("user_connections", []) if c.get("id") == conn_id and c.get("user_id") == panel_user.get("id")), None)
@@ -1374,18 +1375,18 @@ async def _user_delete(api: TelegramAPI, chat_id: int, message_id: int, callback
 
     conn_name = conn.get("name") or name or "Connection"
     rows = [
-        [{"text": "🗑 Delete", "callback_data": _ref("user_delete_confirm", {"conn_id": conn_id})}],
-        [{"text": "❌ Cancel", "callback_data": "refresh"}],
+        [{"text": f"🗑 {_tt(lang, 'btn_delete')}", "callback_data": _ref("user_delete_confirm", {"conn_id": conn_id})}],
+        [{"text": f"❌ {_tt(lang, 'btn_cancel')}", "callback_data": "refresh"}],
     ]
     await api.edit_message(
         chat_id,
         message_id,
-        f"🗑 Delete connection <b>{_e(conn_name)}</b>?\n\nThis action cannot be undone.",
+        _tt(lang, "delete_connection_confirm", name=_e(conn_name)) + f"\n\n{_tt(lang, 'cannot_be_undone')}",
         reply_markup={"inline_keyboard": rows},
     )
 
 
-async def _user_delete_confirm(api: TelegramAPI, chat_id: int, message_id: int, callback_id: str, tg_id: str, tg_username: Optional[str], conn_id: str, load_data_fn: Callable, self_service_svc):
+async def _user_delete_confirm(api: TelegramAPI, chat_id: int, message_id: int, callback_id: str, tg_id: str, tg_username: Optional[str], conn_id: str, load_data_fn: Callable, self_service_svc, lang: str = "en"):
     panel_user = _find_user(load_data_fn, tg_id, tg_username)
     if not panel_user:
         await api.answer_callback(callback_id, text="Access denied")
@@ -1415,10 +1416,10 @@ async def _user_delete_confirm(api: TelegramAPI, chat_id: int, message_id: int, 
     conns = [c for c in data.get("user_connections", []) if c.get("user_id") == panel_user.get("id")]
     if not conns:
         if _self_service_telegram_enabled(data):
-            kb = _build_connections_keyboard(conns, data)
-            await api.edit_message(chat_id, message_id, "✅ Connection deleted.\n\nYou have no connections yet. Create one below!", reply_markup=kb)
+            kb = _build_connections_keyboard(conns, data, lang)
+            await api.edit_message(chat_id, message_id, f"✅ {_tt(lang, 'connection_deleted')}\n\n{_tt(lang, 'no_connections_create_short')}", reply_markup=kb)
         else:
-            await api.edit_message(chat_id, message_id, "✅ Connection deleted. You have no connections.")
+            await api.edit_message(chat_id, message_id, f"✅ {_tt(lang, 'connection_deleted_no_connections')}")
         return
     kb = _build_connections_keyboard(conns, data)
     await api.edit_message(chat_id, message_id, f"✅ Connection deleted.\n\n<b>Your connections</b> ({len(conns)}) — tap to get config:", reply_markup=kb)
@@ -1550,6 +1551,7 @@ async def _dispatch(api: TelegramAPI, update: dict, load_data_fn: Callable, gene
         message_id = cq["message"]["message_id"]
         tg_id = str(cq["from"]["id"])
         tg_username = cq["from"].get("username")
+        lang = _tg_lang(cq["from"])
 
         if data_str == "noop":
             await api.answer_callback(callback_id)
@@ -1563,7 +1565,7 @@ async def _dispatch(api: TelegramAPI, update: dict, load_data_fn: Callable, gene
 
         # Self-service user callbacks (before admin gate).
         if data_str == "user_create":
-            await _user_create_start(api, chat_id, message_id, callback_id, tg_id, tg_username, load_data_fn, self_service_svc)
+            await _user_create_start(api, chat_id, message_id, callback_id, tg_id, tg_username, load_data_fn, self_service_svc, lang)
             return
         if data_str == "user_create_cancel":
             await _user_create_cancel(api, chat_id, message_id, callback_id, tg_id, tg_username, load_data_fn)
@@ -1577,16 +1579,16 @@ async def _dispatch(api: TelegramAPI, update: dict, load_data_fn: Callable, gene
                 await _user_create_server(api, chat_id, message_id, callback_id, tg_id, tg_username, int(payload.get("sid", 0)), load_data_fn, self_service_svc)
                 return
             if action == "user_create_protocol":
-                await _user_create_protocol(api, chat_id, message_id, callback_id, tg_id, tg_username, int(payload.get("sid", 0)), payload.get("proto", "awg"), load_data_fn)
+                await _user_create_protocol(api, chat_id, message_id, callback_id, tg_id, tg_username, int(payload.get("sid", 0)), payload.get("proto", "awg"), load_data_fn, lang)
                 return
             if action == "user_add_client":
                 await _user_add_client_final(api, chat_id, message_id, callback_id, tg_id, tg_username, int(payload.get("sid", 0)), payload.get("proto", "awg"), payload.get("name", ""), load_data_fn, generate_vpn_link_fn, self_service_svc)
                 return
             if action == "user_delete":
-                await _user_delete(api, chat_id, message_id, callback_id, tg_id, tg_username, payload.get("conn_id", ""), payload.get("name", ""), load_data_fn)
+                await _user_delete(api, chat_id, message_id, callback_id, tg_id, tg_username, payload.get("conn_id", ""), payload.get("name", ""), load_data_fn, lang)
                 return
             if action == "user_delete_confirm":
-                await _user_delete_confirm(api, chat_id, message_id, callback_id, tg_id, tg_username, payload.get("conn_id", ""), load_data_fn, self_service_svc)
+                await _user_delete_confirm(api, chat_id, message_id, callback_id, tg_id, tg_username, payload.get("conn_id", ""), load_data_fn, self_service_svc, lang)
                 return
 
         panel_user = _require_admin(load_data_fn, tg_id, tg_username)
