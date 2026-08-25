@@ -326,6 +326,18 @@ class TelegramAPI:
         return r.json()
 
 
+async def _set_default_commands(api: TelegramAPI):
+    await api.call(
+        "setMyCommands",
+        commands=[
+            {"command": "start", "description": "Open bot menu"},
+            {"command": "connections", "description": "Show my connections"},
+            {"command": "connect", "description": "Create a new connection"},
+            {"command": "disconnect", "description": "Delete a connection"},
+        ],
+    )
+
+
 # ----------------------------------------------------------------------- #
 #  Generic helpers
 # ----------------------------------------------------------------------- #
@@ -1364,6 +1376,36 @@ async def _user_create_start(api: TelegramAPI, chat_id: int, message_id: int, ca
     )
 
 
+async def _user_create_start_message(api: TelegramAPI, chat_id: int, tg_id: str, tg_username: Optional[str], load_data_fn: Callable, lang: str = "en"):
+    panel_user = _find_user(load_data_fn, tg_id, tg_username)
+    if not panel_user:
+        await api.send_message(chat_id, f"❌ {_tt(lang, 'access_denied')}")
+        return
+
+    data = load_data_fn()
+    if not _self_service_telegram_enabled(data):
+        await api.send_message(chat_id, _tt(lang, "self_service_disabled_contact"))
+        return
+
+    eligible = _get_eligible_servers(data)
+    if not eligible:
+        await api.send_message(chat_id, _tt(lang, "self_service_no_servers"))
+        return
+
+    rows = []
+    for sid, server, protos in eligible:
+        name = server.get("name") or server.get("host") or f"Server {sid + 1}"
+        proto_text = ", ".join(_protocol_display_name(p) for p in protos)
+        rows.append([{"text": f"🖥 {name} ({proto_text})", "callback_data": _ref("user_create_server", {"sid": sid})}])
+    rows.append([{"text": f"❌ {_tt(lang, 'btn_cancel')}", "callback_data": "user_create_cancel"}])
+
+    await api.send_message(
+        chat_id,
+        f"➕ <b>{_tt(lang, 'btn_create_connection')}</b>\n\n{_tt(lang, 'choose_server')}",
+        reply_markup={"inline_keyboard": rows},
+    )
+
+
 async def _user_create_server(api: TelegramAPI, chat_id: int, message_id: int, callback_id: str, tg_id: str, tg_username: Optional[str], server_id: int, load_data_fn: Callable, self_service_svc, lang: str = "en"):
     panel_user = _find_user(load_data_fn, tg_id, tg_username)
     if not panel_user:
@@ -1591,6 +1633,7 @@ async def _run_bot(token: str, load_data_fn: Callable, generate_vpn_link_fn: Cal
             logger.error(f"Telegram bot: invalid token or API error: {me}")
             return
         logger.info(f"Telegram bot logged in as @{me['result']['username']}")
+        await _set_default_commands(api)
 
         while True:
             try:
@@ -1624,6 +1667,14 @@ async def _dispatch(api: TelegramAPI, update: dict, load_data_fn: Callable, gene
         if text.startswith("/start") or text.startswith("/admin"):
             await _handle_start(api, msg, load_data_fn)
         elif text.startswith("/connections"):
+            panel_user = _find_user(load_data_fn, str(msg["from"]["id"]), tg_username)
+            if not panel_user:
+                await api.send_message(msg["chat"]["id"], f" {_tt(lang, 'access_denied')}")
+            else:
+                await _send_user_connections(api, msg["chat"]["id"], panel_user, load_data_fn, lang=lang)
+        elif text.startswith("/connect"):
+            await _user_create_start_message(api, msg["chat"]["id"], str(msg["from"]["id"]), tg_username, load_data_fn, lang)
+        elif text.startswith("/disconnect"):
             panel_user = _find_user(load_data_fn, str(msg["from"]["id"]), tg_username)
             if not panel_user:
                 await api.send_message(msg["chat"]["id"], f" {_tt(lang, 'access_denied')}")

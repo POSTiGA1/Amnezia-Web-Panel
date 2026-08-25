@@ -7,6 +7,71 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import telegram_bot as tg_bot
 
 
+class TestTelegramCommandMenu(unittest.IsolatedAsyncioTestCase):
+    """Test Telegram slash-command suggestions."""
+
+    async def test_default_command_menu_contains_user_commands_only(self):
+        api = AsyncMock()
+        api.call = AsyncMock(return_value={'ok': True})
+
+        await tg_bot._set_default_commands(api)
+
+        api.call.assert_awaited_once_with(
+            'setMyCommands',
+            commands=[
+                {'command': 'start', 'description': 'Open bot menu'},
+                {'command': 'connections', 'description': 'Show my connections'},
+                {'command': 'connect', 'description': 'Create a new connection'},
+                {'command': 'disconnect', 'description': 'Delete a connection'},
+            ],
+        )
+
+
+class TestUserSlashCommands(unittest.IsolatedAsyncioTestCase):
+    """Test user slash commands shown in Telegram suggestions."""
+
+    def setUp(self):
+        tg_bot._callback_refs.clear()
+        tg_bot._pending_inputs.clear()
+        self.data = base_data()
+        self.load_data = lambda: self.data
+        self.api = AsyncMock()
+        self.api.send_message = AsyncMock()
+        self.api.edit_message = AsyncMock()
+        self.api.answer_callback = AsyncMock()
+
+    async def test_connect_command_starts_create_flow(self):
+        msg = _text_message(chat_id=111, from_id=111, text='/connect')
+
+        await _dispatch_message_with_service(self.api, msg, self.load_data, MagicMock())
+
+        self.api.send_message.assert_called()
+        text = self.api.send_message.call_args[0][1]
+        reply_markup = self.api.send_message.call_args[1].get('reply_markup', {})
+        keyboard_text = json.dumps(reply_markup, ensure_ascii=False)
+        self.assertIn('Create connection', text)
+        self.assertIn('Choose a server', text)
+        self.assertIn('Server 1', keyboard_text)
+
+    async def test_disconnect_command_shows_connections_with_delete_buttons(self):
+        self.data['user_connections'] = [{
+            'id': 'conn-1',
+            'user_id': 'user-1',
+            'server_id': 0,
+            'protocol': 'awg',
+            'name': 'Phone',
+            'created_by': 'self_service',
+        }]
+        msg = _text_message(chat_id=111, from_id=111, text='/disconnect')
+
+        await _dispatch_message_with_service(self.api, msg, self.load_data, MagicMock())
+
+        reply_markup = self.api.send_message.call_args[1].get('reply_markup', {})
+        keyboard_text = json.dumps(reply_markup, ensure_ascii=False)
+        self.assertIn('Phone', keyboard_text)
+        self.assertIn('🗑', keyboard_text)
+
+
 def base_data():
     return {
         'settings': {
@@ -480,6 +545,11 @@ async def _dispatch_callback_with_service(api, update, load_data, service):
 async def _dispatch_message(api, update, load_data):
     generate_vpn_link_fn = lambda c: f'vpn://{c}'
     await tg_bot._dispatch(api, update, load_data, generate_vpn_link_fn, None)
+
+
+async def _dispatch_message_with_service(api, update, load_data, service):
+    generate_vpn_link_fn = lambda c: f'vpn://{c}'
+    await tg_bot._dispatch(api, update, load_data, generate_vpn_link_fn, None, self_service_svc=service)
 
 
 if __name__ == '__main__':
