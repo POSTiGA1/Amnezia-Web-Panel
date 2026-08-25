@@ -27,6 +27,131 @@ _pending_inputs = {}
 CLIENT_PROTOCOLS = {"awg", "awg2", "awg_legacy", "xray", "telemt", "wireguard"}
 SERVICE_PROTOCOLS = {"dns", "adguard", "socks5", "nginx"}
 
+TG_TRANSLATIONS = {
+    "en": {
+        "hi": "Hi",
+        "account_not_linked": "Your Telegram account is not linked to any panel user.",
+        "contact_admin_to_link": "Please contact your administrator — they need to add your Telegram ID to your profile.",
+        "your_telegram_id": "Your Telegram ID",
+        "registered_admin": "You are registered as <b>{username}</b> with <b>Admin</b> role.",
+        "choose_action": "Choose an action:",
+        "registered_as": "You are registered as <b>{username}</b>.",
+        "no_connections_create": "You have no connections yet. Tap the button below to create one!",
+        "no_connections_contact_admin": "You have no connections yet. Please contact your administrator.",
+        "your_connections": "<b>Your connections</b> ({count}) — tap to get config:",
+        "updated": "Updated!",
+        "access_denied": "Access denied.",
+        "no_connections_create_short": "You have no connections. Tap the button below to create one!",
+        "no_connections": "You have no connections.",
+        "fetching_config": "Fetching config...",
+        "connection_not_found": "Connection not found.",
+        "server_not_found": "Server not found.",
+        "fetching_config_for": "Fetching config for <b>{name}</b>...",
+        "failed_retrieve_config": "Failed to retrieve configuration.",
+        "admin_menu": "Admin menu",
+        "action_expired": "Action expired. Use /start again.",
+        "btn_create_connection": "Create connection",
+        "btn_refresh_list": "Refresh list",
+        "btn_back": "Back",
+        "btn_do_not_assign": "Do not assign",
+        "btn_cancel": "Cancel",
+        "btn_servers": "Servers",
+        "btn_users": "Users",
+        "btn_my_connections": "My connections",
+        "btn_how_add_server": "How to add a server",
+        "btn_admin_menu": "Admin menu",
+        "btn_no_installed_protocols": "No installed protocols",
+        "btn_connections": "Connections",
+        "btn_stop": "Stop",
+        "btn_start": "Start",
+        "btn_protocols": "Protocols",
+        "btn_config": "Config",
+        "btn_disable": "Disable",
+        "btn_enable": "Enable",
+        "btn_delete": "Delete",
+        "btn_protocol": "Protocol",
+        "choose_server": "Choose a server:",
+        "choose_protocol": "Choose a protocol:",
+        "protocol_label": "Protocol",
+        "send_device_name": "Send the device name in the next message.",
+        "example_label": "Example",
+        "delete_connection_confirm": "Delete connection <b>{name}</b>?",
+        "cannot_be_undone": "This cannot be undone.",
+        "connection_deleted": "Connection deleted.",
+        "connection_deleted_no_connections": "Connection deleted. You have no connections.",
+        "connection_created_no_config": "Connection created, but no config is available.",
+        "creating_connection_named": "Creating connection <b>{name}</b>...",
+        "self_service_creation_disabled": "Self-service connection creation is currently disabled.\nPlease contact your administrator.",
+        "self_service_no_servers": "No servers are available for self-service connection creation.\nPlease contact your administrator.",
+        "self_service_disabled_contact": "Self-service is disabled. Contact your administrator.",
+        "self_service_unavailable": "Self-service is not available.",
+        "server_not_self_service": "This server is not available for self-service.",
+        "no_protocols_available": "No protocols available on this server.",
+        "name_empty": "Name cannot be empty. Send a connection name or /cancel.",
+    },
+    "ru": {
+        "hi": "Привет",
+        "account_not_linked": "Ваш аккаунт Telegram не привязан ни к одному пользователю панели.",
+        "contact_admin_to_link": "Обратитесь к администратору — он должен добавить ваш Telegram ID в профиль.",
+        "your_telegram_id": "Ваш Telegram ID",
+        "registered_admin": "Вы зарегистрированы как <b>{username}</b> с ролью <b>Admin</b>.",
+        "choose_action": "Выберите действие:",
+        "registered_as": "Вы зарегистрированы как <b>{username}</b>.",
+        "no_connections_create": "У вас пока нет подключений. Нажмите кнопку ниже, чтобы создать первое.",
+        "no_connections_contact_admin": "У вас пока нет подключений. Обратитесь к администратору.",
+        "your_connections": "<b>Ваши подключения</b> ({count}) — нажмите, чтобы получить конфигурацию:",
+        "updated": "Обновлено!",
+        "access_denied": "Доступ запрещён.",
+        "no_connections_create_short": "У вас нет подключений. Нажмите кнопку ниже, чтобы создать первое.",
+        "no_connections": "У вас нет подключений.",
+        "fetching_config": "Получаю конфигурацию...",
+        "connection_not_found": "Подключение не найдено.",
+        "server_not_found": "Сервер не найден.",
+        "fetching_config_for": "Получаю конфигурацию для <b>{name}</b>...",
+        "failed_retrieve_config": "Не удалось получить конфигурацию.",
+        "admin_menu": "Меню администратора",
+        "action_expired": "Действие устарело. Используйте /start снова.",
+        "btn_create_connection": "Создать подключение",
+        "btn_refresh_list": "Обновить список",
+        "btn_back": "Назад",
+        "btn_do_not_assign": "Не назначать",
+        "btn_cancel": "Отмена",
+        "btn_servers": "Серверы",
+        "btn_users": "Пользователи",
+        "btn_my_connections": "Мои подключения",
+        "btn_how_add_server": "Как добавить сервер",
+        "btn_admin_menu": "Меню администратора",
+        "btn_no_installed_protocols": "Нет установленных протоколов",
+        "btn_connections": "Подключения",
+        "btn_stop": "Остановить",
+        "btn_start": "Запустить",
+        "btn_protocols": "Протоколы",
+        "btn_config": "Конфигурация",
+        "btn_disable": "Отключить",
+        "btn_enable": "Включить",
+        "btn_delete": "Удалить",
+        "btn_protocol": "Протокол",
+        "choose_server": "Выберите сервер:",
+        "choose_protocol": "Выберите протокол:",
+        "protocol_label": "Протокол",
+        "send_device_name": "Отправьте имя устройства следующим сообщением.",
+        "example_label": "Пример",
+        "delete_connection_confirm": "Удалить подключение <b>{name}</b>?",
+        "cannot_be_undone": "Это действие нельзя отменить.",
+        "connection_deleted": "Подключение удалено.",
+        "connection_deleted_no_connections": "Подключение удалено. У вас нет подключений.",
+        "connection_created_no_config": "Подключение создано, но конфигурация недоступна.",
+        "creating_connection_named": "Создаю подключение <b>{name}</b>...",
+        "self_service_creation_disabled": "Создание подключений через self-service сейчас отключено.\nОбратитесь к администратору.",
+        "self_service_no_servers": "Нет серверов, доступных для создания подключений через self-service.\nОбратитесь к администратору.",
+        "self_service_disabled_contact": "Self-service отключён. Обратитесь к администратору.",
+        "self_service_unavailable": "Self-service недоступен.",
+        "server_not_self_service": "Этот сервер недоступен для self-service.",
+        "no_protocols_available": "На этом сервере нет доступных протоколов.",
+        "name_empty": "Имя не может быть пустым. Отправьте имя подключения или /cancel.",
+    },
+}
+
 
 # ----------------------------------------------------------------------- #
 #  Public lifecycle
@@ -110,6 +235,18 @@ def _e(value) -> str:
     return html.escape(str(value if value is not None else ""))
 
 
+
+
+def _tg_lang(from_user: Optional[dict]) -> str:
+    code = str((from_user or {}).get("language_code") or "").lower()
+    if code.startswith("ru"):
+        return "ru"
+    return "en"
+
+
+def _tt(lang: str, key: str, **kwargs) -> str:
+    text = TG_TRANSLATIONS.get(lang, TG_TRANSLATIONS["en"]).get(key, TG_TRANSLATIONS["en"].get(key, key))
+    return text.format(**kwargs) if kwargs else text
 def _format_bytes(value) -> str:
     try:
         value = float(value or 0)
@@ -161,8 +298,10 @@ def _find_user(load_data_fn: Callable, tg_id: str, username: Optional[str] = Non
             return u
     # Fallback: try username-based lookup
     if username:
+        username_clean = str(username).lstrip("@").lower()
         for u in data.get("users", []):
-            if str(u.get("telegramId", "") or "").lower() == str(username).lower():
+            stored = str(u.get("telegramId", "") or "").lstrip("@").lower()
+            if stored and stored == username_clean:
                 return u
     return None
 
@@ -205,8 +344,7 @@ def _self_service_telegram_enabled(data: dict) -> bool:
         return False
     settings = data.get("settings", {}) or {}
     ss = settings.get("self_service", {}) or {}
-    telegram_ss = ss.get("telegram", {}) or {}
-    return bool(telegram_ss.get("enabled", False))
+    return bool(ss.get("telegram_enabled", False))
 
 
 def _get_eligible_servers(data: dict, allowed_protocols: Optional[set] = None) -> list:
