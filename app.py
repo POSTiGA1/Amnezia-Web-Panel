@@ -27,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi import FastAPI, Request, Query, UploadFile, File
 from starlette.middleware.sessions import SessionMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List, Dict
 import uvicorn
 import httpx
@@ -212,8 +212,20 @@ def load_data():
 
 
 def save_data(data):
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    data_dir = os.path.dirname(DATA_FILE) or '.'
+    fd, tmp_path = tempfile.mkstemp(prefix='.data-', suffix='.json', dir=data_dir)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, DATA_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 async def save_data_async(data):
@@ -1058,6 +1070,15 @@ self_service_connections = ConnectionService(
 )
 
 
+def _self_service_error_response(exc):
+    if isinstance(exc, RateLimitError):
+        return JSONResponse({'error': str(exc)}, status_code=429)
+    if isinstance(exc, SelfServiceError):
+        return JSONResponse({'error': str(exc)}, status_code=exc.status_code)
+    logger.exception("Unexpected self-service error")
+    return JSONResponse({'error': 'Internal server error'}, status_code=500)
+
+
 # ===================== API tokens =====================
 
 API_TOKEN_PREFIX = 'awp_'  # "Amnezia Web Panel" — makes tokens visually distinct in logs / configs
@@ -1646,10 +1667,10 @@ class SelfServiceSettings(BaseModel):
     enabled: bool = False
     web_enabled: bool = True
     telegram_enabled: bool = True
-    max_connections_per_user: int = 5
-    rate_limit_count: int = 3
-    rate_limit_window_seconds: int = 60
-    allowed_protocols: List[str] = ['awg', 'awg2']
+    max_connections_per_user: int = Field(5, ge=1, le=100)
+    rate_limit_count: int = Field(3, ge=1, le=100)
+    rate_limit_window_seconds: int = Field(60, ge=1, le=86400)
+    allowed_protocols: List[str] = Field(default_factory=lambda: ['awg', 'awg2'])
 
 
 class SelfServiceConnectionRequest(BaseModel):
@@ -1683,6 +1704,17 @@ class SaveSettingsRequest(BaseModel):
 
 class ToggleUserRequest(BaseModel):
     enabled: bool
+
+
+def _normalize_telegram_id(value):
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+    if not normalized.isdigit():
+        raise ValueError('Telegram ID must be numeric')
+    return normalized
 
 
 class AddUserConnectionRequest(BaseModel):
@@ -3461,6 +3493,10 @@ async def api_add_user(request: Request, req: AddUserRequest):
     try:
         data = load_data()
         lang = request.cookies.get('lang', 'ru')
+        try:
+            telegram_id = _normalize_telegram_id(req.telegramId)
+        except ValueError as exc:
+            return JSONResponse({'error': str(exc)}, status_code=400)
         # Check duplicate
         if any(u['username'] == req.username for u in data.get('users', [])):
             return JSONResponse({'error': _t('user_exists', lang)}, status_code=400)
@@ -3471,7 +3507,7 @@ async def api_add_user(request: Request, req: AddUserRequest):
             'username': req.username,
             'password_hash': hash_password(req.password),
             'role': req.role,
-            'telegramId': req.telegramId,
+            'telegramId': telegram_id,
             'email': req.email,
             'description': req.description,
             'traffic_limit': int(req.traffic_limit * 1024**3) if req.traffic_limit else 0,
@@ -3549,7 +3585,11 @@ async def api_update_user(request: Request, user_id: str, req: UpdateUserRequest
         if not user:
             return JSONResponse({'error': 'User not found'}, status_code=404)
             
-        if req.telegramId is not None: user['telegramId'] = req.telegramId
+        if req.telegramId is not None:
+            try:
+                user['telegramId'] = _normalize_telegram_id(req.telegramId)
+            except ValueError as exc:
+                return JSONResponse({'error': str(exc)}, status_code=400)
         if req.email is not None: user['email'] = req.email
         if req.description is not None: user['description'] = req.description
         if req.traffic_limit is not None: 
@@ -3748,11 +3788,8 @@ async def api_my_connection_options(request: Request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
         return await self_service_connections.get_self_service_options(user['id'], 'web')
-    except SelfServiceError as e:
-        return JSONResponse({'error': str(e)}, status_code=e.status_code)
-    except Exception as e:
-        logger.exception("Error getting self-service options")
-        return JSONResponse({'error': str(e)}, status_code=500)
+    except Exception as exc:
+        return _self_service_error_response(exc)
 
 
 @app.post('/api/my/connections/add', tags=["Self-service"])
@@ -3764,11 +3801,8 @@ async def api_my_connection_add(request: Request, payload: SelfServiceConnection
         return await self_service_connections.create_user_connection(
             user['id'], payload.server_id, payload.protocol, payload.name, 'web'
         )
-    except SelfServiceError as e:
-        return JSONResponse({'error': str(e)}, status_code=e.status_code)
-    except Exception as e:
-        logger.exception("Error creating self-service connection")
-        return JSONResponse({'error': str(e)}, status_code=500)
+    except Exception as exc:
+        return _self_service_error_response(exc)
 
 
 @app.post('/api/my/connections/{connection_id}/delete', tags=["Self-service"])
@@ -3778,11 +3812,8 @@ async def api_my_connection_delete(request: Request, connection_id: str):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
         return await self_service_connections.delete_user_connection(user['id'], connection_id, 'web')
-    except SelfServiceError as e:
-        return JSONResponse({'error': str(e)}, status_code=e.status_code)
-    except Exception as e:
-        logger.exception("Error deleting self-service connection")
-        return JSONResponse({'error': str(e)}, status_code=500)
+    except Exception as exc:
+        return _self_service_error_response(exc)
 
 
 @app.post('/api/users/{user_id}/share/setup', tags=["Users"])
@@ -4072,7 +4103,9 @@ async def save_settings(request: Request, payload: SaveSettingsRequest):
         'last_created_count': old_auto_backup.get('last_created_count', 0),
         'last_error': old_auto_backup.get('last_error')
     }
-    settings['self_service'] = payload.self_service.dict()
+    self_service = payload.self_service.dict()
+    self_service['allowed_protocols'] = [p for p in self_service.get('allowed_protocols', []) if p in ('awg', 'awg2')]
+    settings['self_service'] = self_service
     save_data(data)
     logger.info("Settings saved (including captcha, telegram and auto backup)")
 

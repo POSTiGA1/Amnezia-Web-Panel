@@ -28,6 +28,11 @@ class FakeManager:
         self.removed.append((protocol, client_id))
 
 
+class FailingManager(FakeManager):
+    def add_client(self, protocol, name, host, port):
+        raise RuntimeError('remote failed')
+
+
 def base_data():
     return {
         'settings': {
@@ -93,6 +98,15 @@ class ConnectionServiceTest(unittest.IsolatedAsyncioTestCase):
             await service.create_user_connection('user-1', 0, 'awg', 'bad\nname', 'web')
 
         self.assertIn('name', str(ctx.exception).lower())
+
+    async def test_create_rejects_html_sensitive_name_characters(self):
+        service, _, _ = self.make_service()
+
+        for name in ('bad<name', 'bad>name', 'bad"name', "bad'name", 'bad&name'):
+            with self.subTest(name=name):
+                with self.assertRaises(SelfServiceError) as ctx:
+                    await service.create_user_connection('user-1', 0, 'awg', name, 'web')
+                self.assertIn('name', str(ctx.exception).lower())
 
     async def test_create_rejects_when_global_self_service_disabled(self):
         data = base_data()
@@ -173,6 +187,51 @@ class ConnectionServiceTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RateLimitError):
             await service.create_user_connection('user-1', 0, 'awg', 'two', 'web')
 
+    async def test_failed_create_attempt_consumes_rate_limit(self):
+        data = base_data()
+        data['settings']['self_service']['rate_limit_count'] = 1
+        service, _, _ = self.make_service(data, manager=FailingManager())
+
+        with self.assertRaises(RuntimeError):
+            await service.create_user_connection('user-1', 0, 'awg', 'one', 'web')
+        with self.assertRaises(RateLimitError):
+            await service.create_user_connection('user-1', 0, 'awg', 'two', 'web')
+
+    async def test_rate_limit_is_shared_across_sources(self):
+        data = base_data()
+        data['settings']['self_service']['rate_limit_count'] = 1
+        service, _, _ = self.make_service(data)
+
+        await service.create_user_connection('user-1', 0, 'awg', 'one', 'web')
+        with self.assertRaises(RateLimitError):
+            await service.create_user_connection('user-1', 0, 'awg', 'two', 'telegram')
+
+    async def test_delete_is_rate_limited(self):
+        data = base_data()
+        data['settings']['self_service']['rate_limit_count'] = 1
+        data['user_connections'].append({
+            'id': 'conn-1',
+            'user_id': 'user-1',
+            'server_id': 0,
+            'protocol': 'awg',
+            'client_id': 'client-1',
+            'name': 'phone',
+            'created_by': 'self_service',
+        })
+        service, _, _ = self.make_service(data)
+
+        await service.delete_user_connection('user-1', 'conn-1', 'web')
+        with self.assertRaises(RateLimitError):
+            await service.delete_user_connection('user-1', 'missing', 'web')
+
+    async def test_zero_rate_limit_denies_requests(self):
+        data = base_data()
+        data['settings']['self_service']['rate_limit_count'] = 0
+        service, _, _ = self.make_service(data)
+
+        with self.assertRaises(RateLimitError):
+            await service.create_user_connection('user-1', 0, 'awg', 'home', 'web')
+
     async def test_create_fails_for_expired_user(self):
         data = base_data()
         data['users'][0]['expiration_date'] = '2020-01-01T00:00:00+00:00'
@@ -182,6 +241,17 @@ class ConnectionServiceTest(unittest.IsolatedAsyncioTestCase):
             await service.create_user_connection('user-1', 0, 'awg', 'home', 'web')
 
         self.assertIn('expir', str(ctx.exception).lower())
+
+    async def test_create_fails_for_unparsable_expiration_date(self):
+        data = base_data()
+        data['users'][0]['expiration_date'] = 'not-a-date'
+        service, _, _ = self.make_service(data)
+
+        with self.assertLogs('connection_service', level='WARNING'):
+            with self.assertRaises(SelfServiceError) as ctx:
+                await service.create_user_connection('user-1', 0, 'awg', 'home', 'web')
+
+        self.assertTrue(ctx.exception.forbidden)
 
     async def test_create_fails_for_disabled_user(self):
         data = base_data()
@@ -266,6 +336,41 @@ class ConnectionServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r1['status'], 'success')
         self.assertEqual(r2['status'], 'success')
         self.assertNotEqual(r1['connection']['id'], r2['connection']['id'])
+
+    async def test_create_merges_connection_into_fresh_data_after_provisioning(self):
+        state = base_data()
+        state['settings']['self_service']['rate_limit_count'] = 10
+        fake_manager = FakeManager()
+
+        def load_data():
+            return state
+
+        def save_data(new_data):
+            state.clear()
+            state.update(new_data)
+
+        class MutatingManager(FakeManager):
+            def add_client(self, protocol, name, host, port):
+                state['users'][0]['enabled'] = False
+                return super().add_client(protocol, name, host, port)
+
+        fake_manager = MutatingManager()
+        service = ConnectionService(
+            load_data=load_data,
+            save_data=save_data,
+            data_lock=asyncio.Lock(),
+            get_ssh=lambda server: FakeSSH(),
+            get_protocol_manager=lambda ssh, protocol: fake_manager,
+            manager_call=lambda manager, method, protocol, *args: getattr(manager, method)(protocol, *args),
+            generate_vpn_link=lambda config: f'vpn://{config}',
+        )
+
+        with self.assertRaises(SelfServiceError):
+            await service.create_user_connection('user-1', 0, 'awg', 'first', 'web')
+
+        self.assertFalse(state['users'][0]['enabled'])
+        self.assertEqual(state['user_connections'], [])
+        self.assertEqual(fake_manager.removed, [('awg', 'client-1')])
 
 
 if __name__ == '__main__':

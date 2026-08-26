@@ -53,6 +53,14 @@ class TestUserSlashCommands(unittest.IsolatedAsyncioTestCase):
         self.assertIn('Choose a server', text)
         self.assertIn('Server 1', keyboard_text)
 
+    async def test_connect_command_is_rejected_in_group_chat(self):
+        msg = _text_message(chat_id=-100, from_id=111, text='/connect', chat_type='group')
+
+        await _dispatch_message_with_service(self.api, msg, self.load_data, MagicMock())
+
+        text = self.api.send_message.call_args[0][1]
+        self.assertIn('private', text.lower())
+
     async def test_disconnect_command_shows_connections_with_delete_buttons(self):
         self.data['user_connections'] = [{
             'id': 'conn-1',
@@ -70,6 +78,23 @@ class TestUserSlashCommands(unittest.IsolatedAsyncioTestCase):
         keyboard_text = json.dumps(reply_markup, ensure_ascii=False)
         self.assertIn('Phone', keyboard_text)
         self.assertIn('🗑', keyboard_text)
+
+    async def test_config_callback_is_rejected_in_group_chat(self):
+        self.data['user_connections'] = [{
+            'id': 'conn-1',
+            'user_id': 'user-1',
+            'server_id': 0,
+            'protocol': 'awg',
+            'client_id': 'client-1',
+            'name': 'Phone',
+            'created_by': 'self_service',
+        }]
+        msg = _callback_update(chat_id=-100, from_id=111, data_str='cfg:conn-1', chat_type='group')
+
+        await _dispatch_callback(self.api, msg, self.load_data)
+
+        text = self.api.send_message.call_args[0][1]
+        self.assertIn('private', text.lower())
 
 
 def base_data():
@@ -261,6 +286,19 @@ class TestUserSelfServiceCreation(unittest.IsolatedAsyncioTestCase):
         await _dispatch_callback_with_service(self.api, msg, self.load_data, self.mock_service)
         self.mock_service.create_user_connection.assert_not_called()
 
+    async def test_creation_error_does_not_expose_exception_text(self):
+        self.mock_service.create_user_connection = AsyncMock(side_effect=RuntimeError('secret host path'))
+        payload = {'sid': 0, 'proto': 'awg', 'name': 'MyPhone'}
+        ref_key = tg_bot._ref('user_add_client', payload)
+        msg = _callback_update(chat_id=111, from_id=111, data_str=ref_key)
+
+        with self.assertLogs(tg_bot.logger, level='ERROR'):
+            await _dispatch_callback_with_service(self.api, msg, self.load_data, self.mock_service)
+
+        text = self.api.send_message.call_args[0][1]
+        self.assertNotIn('secret host path', text)
+        self.assertIn('error', text.lower())
+
 
 class TestUserAddClientNameInputState(unittest.IsolatedAsyncioTestCase):
     """Test user_add_client_name pending input resolves user fresh."""
@@ -286,7 +324,7 @@ class TestUserAddClientNameInputState(unittest.IsolatedAsyncioTestCase):
         })
 
     async def test_input_state_resolves_user_fresh(self):
-        tg_bot._pending_inputs['111'] = {
+        tg_bot._pending_inputs['111:111'] = {
             'kind': 'user_add_client_name',
             'sid': 0,
             'proto': 'awg',
@@ -303,7 +341,7 @@ class TestUserAddClientNameInputState(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call_args[0][0], 'user-1')
 
     async def test_input_state_rejects_unlinked_user(self):
-        tg_bot._pending_inputs['999'] = {
+        tg_bot._pending_inputs['999:999'] = {
             'kind': 'user_add_client_name',
             'sid': 0,
             'proto': 'awg',
@@ -318,6 +356,23 @@ class TestUserAddClientNameInputState(unittest.IsolatedAsyncioTestCase):
         self.api.send_message.assert_called()
         text = self.api.send_message.call_args[0][1]
         self.assertIn('denied', text.lower())
+
+    async def test_pending_input_is_scoped_to_chat_and_user(self):
+        tg_bot._pending_inputs['100:111'] = {
+            'kind': 'user_add_client_name',
+            'sid': 0,
+            'proto': 'awg',
+            'ts': 0,
+        }
+        msg = {'chat': {'id': 100, 'type': 'private'}, 'from': {'id': 222, 'first_name': 'Test'}, 'text': 'OtherPhone'}
+
+        handled = await tg_bot._handle_pending_input(
+            self.api, msg, self.load_data, None, lambda c: 'vpn://x', self.mock_service
+        )
+
+        self.assertFalse(handled)
+        self.mock_service.create_user_connection.assert_not_called()
+        self.assertIn('100:111', tg_bot._pending_inputs)
 
 
 class TestUserDeleteConnection(unittest.IsolatedAsyncioTestCase):
@@ -410,24 +465,30 @@ class TestUserDeleteConnection(unittest.IsolatedAsyncioTestCase):
         await _dispatch_callback_with_service(self.api, msg, self.load_data, self.mock_service)
         self.mock_service.delete_user_connection.assert_not_called()
 
+    async def test_user_delete_error_does_not_expose_exception_text(self):
+        self.mock_service.delete_user_connection = AsyncMock(side_effect=RuntimeError('secret host path'))
+        ref_key = tg_bot._ref('user_delete_confirm', {'conn_id': 'conn-1'})
+        msg = _callback_update(chat_id=111, from_id=111, data_str=ref_key)
 
-class TestFindUserByUsername(unittest.IsolatedAsyncioTestCase):
-    """Telegram username (not just numeric ID) should resolve the panel user."""
+        with self.assertLogs(tg_bot.logger, level='ERROR'):
+            await _dispatch_callback_with_service(self.api, msg, self.load_data, self.mock_service)
+
+        text = self.api.edit_message.call_args[0][2]
+        self.assertNotIn('secret host path', text)
+        self.assertIn('error', text.lower())
+
+
+class TestFindUserNumericIdOnly(unittest.IsolatedAsyncioTestCase):
+    """Telegram usernames are mutable and must not authenticate panel users."""
 
     def setUp(self):
         self.data = base_data()
         self.data['users'][0]['telegramId'] = '@alice'
         self.load_data = lambda: self.data
 
-    def test_matches_stored_username(self):
-        user = tg_bot._find_user(self.load_data, '999', 'alice')
-        self.assertIsNotNone(user)
-        self.assertEqual(user['id'], 'user-1')
-
-    def test_matches_stored_username_with_at_prefix(self):
+    def test_does_not_match_stored_username(self):
         user = tg_bot._find_user(self.load_data, '999', '@alice')
-        self.assertIsNotNone(user)
-        self.assertEqual(user['id'], 'user-1')
+        self.assertIsNone(user)
 
     def test_still_matches_numeric_id(self):
         user = tg_bot._find_user(self.load_data, '222', None)
@@ -439,8 +500,8 @@ class TestFindUserByUsername(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(user)
 
 
-class TestDispatchResolvesUsername(unittest.IsolatedAsyncioTestCase):
-    """A callback from a user whose telegramId is stored as a username resolves correctly."""
+class TestDispatchRejectsUsernameSpoof(unittest.IsolatedAsyncioTestCase):
+    """A callback username must not resolve a panel account."""
 
     def setUp(self):
         tg_bot._callback_refs.clear()
@@ -453,13 +514,11 @@ class TestDispatchResolvesUsername(unittest.IsolatedAsyncioTestCase):
         self.api.edit_message = AsyncMock()
         self.api.answer_callback = AsyncMock()
 
-    async def test_user_create_resolves_by_username(self):
+    async def test_user_create_rejects_username_match(self):
         msg = _callback_update(chat_id=999, from_id=999, data_str='user_create', username='alice')
         await _dispatch_callback(self.api, msg, self.load_data)
-        self.api.edit_message.assert_called()
-        reply_markup = self.api.edit_message.call_args[1].get('reply_markup', {})
-        keyboard_text = json.dumps(reply_markup)
-        self.assertIn('Server 1', keyboard_text)
+        text = self.api.edit_message.call_args[0][2]
+        self.assertIn('denied', text.lower())
 
 
 class TestTelegramLocalization(unittest.IsolatedAsyncioTestCase):
@@ -503,7 +562,7 @@ class TestTelegramLocalization(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('Users', keyboard_text)
 
 
-def _callback_update(chat_id, from_id, data_str, username=None, language_code=None):
+def _callback_update(chat_id, from_id, data_str, username=None, language_code=None, chat_type='private'):
     from_user = {'id': from_id}
     if username:
         from_user['username'] = username
@@ -513,19 +572,19 @@ def _callback_update(chat_id, from_id, data_str, username=None, language_code=No
         'callback_query': {
             'id': f'cb-{from_id}',
             'from': from_user,
-            'message': {'chat': {'id': chat_id}, 'message_id': 42},
+            'message': {'chat': {'id': chat_id, 'type': chat_type}, 'message_id': 42},
             'data': data_str,
         }
     }
 
 
-def _text_message(chat_id, from_id, text, language_code=None):
+def _text_message(chat_id, from_id, text, language_code=None, chat_type='private'):
     from_user = {'id': from_id, 'first_name': 'Test'}
     if language_code:
         from_user['language_code'] = language_code
     return {
         'message': {
-            'chat': {'id': chat_id},
+            'chat': {'id': chat_id, 'type': chat_type},
             'from': from_user,
             'text': text,
         }

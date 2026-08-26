@@ -406,14 +406,21 @@ def _find_user(load_data_fn: Callable, tg_id: str, username: Optional[str] = Non
         stored = str(u.get("telegramId", "") or "").lstrip("@")
         if stored and stored == tg_id_clean:
             return u
-    # Fallback: try username-based lookup
-    if username:
-        username_clean = str(username).lstrip("@").lower()
-        for u in data.get("users", []):
-            stored = str(u.get("telegramId", "") or "").lstrip("@").lower()
-            if stored and stored == username_clean:
-                return u
     return None
+
+
+def _pending_key(chat_id, from_id) -> str:
+    return f"{chat_id}:{from_id}"
+
+
+def _is_private_chat(chat: Optional[dict]) -> bool:
+    return (chat or {}).get("type", "private") == "private"
+
+
+async def _reject_non_private(api: TelegramAPI, chat_id, lang: str = "en", callback_id: Optional[str] = None):
+    if callback_id:
+        await api.answer_callback(callback_id, "Use a private chat")
+    await api.send_message(chat_id, "For security, use this command in a private chat with the bot.")
 
 
 def _is_admin(panel_user: dict) -> bool:
@@ -1127,11 +1134,11 @@ async def _admin_client_detail(api: TelegramAPI, chat_id: int, message_id: int, 
     await api.edit_message(chat_id, message_id, text, reply_markup=_client_keyboard(server_id, proto, client, lang))
 
 
-async def _admin_add_client(api: TelegramAPI, chat_id: int, message_id: int, server_id: int, proto: str, panel_user: dict, load_data_fn: Callable, save_data_fn: Optional[Callable], generate_vpn_link_fn: Callable, lang: str = "en"):
+async def _admin_add_client(api: TelegramAPI, chat_id: int, message_id: int, server_id: int, proto: str, panel_user: dict, load_data_fn: Callable, save_data_fn: Optional[Callable], generate_vpn_link_fn: Callable, lang: str = "en", tg_id: Optional[str] = None):
     if not save_data_fn:
         await api.edit_message(chat_id, message_id, f"❌ {_tt(lang, 'saving_not_available')}")
         return
-    _pending_inputs[str(chat_id)] = {
+    _pending_inputs[_pending_key(chat_id, tg_id or panel_user.get('telegramId') or panel_user.get('id'))] = {
         "kind": "add_client_name",
         "sid": server_id,
         "proto": proto,
@@ -1275,45 +1282,47 @@ async def _admin_remove_client(api: TelegramAPI, chat_id: int, message_id: int, 
 
 async def _handle_pending_input(api: TelegramAPI, msg: dict, load_data_fn: Callable, save_data_fn: Optional[Callable], generate_vpn_link_fn: Callable, self_service_svc=None) -> bool:
     chat_id = msg["chat"]["id"]
+    from_id = msg["from"]["id"]
     lang = _tg_lang(msg.get("from"))
-    state = _pending_inputs.get(str(chat_id))
+    key = _pending_key(chat_id, from_id)
+    state = _pending_inputs.get(key)
     if not state:
         return False
 
     text = (msg.get("text") or "").strip()
     if text.lower() in ("/cancel", "cancel"):
-        _pending_inputs.pop(str(chat_id), None)
+        _pending_inputs.pop(key, None)
         await api.send_message(chat_id, f"❌ {_tt(lang, 'action_cancelled')}", reply_markup=_admin_main_keyboard(lang))
         return True
     if text.startswith("/"):
-        _pending_inputs.pop(str(chat_id), None)
+        _pending_inputs.pop(key, None)
         return False
 
     if state.get("kind") == "add_client_name":
         panel_user = _require_admin(load_data_fn, str(msg["from"]["id"]), msg["from"].get("username"))
         if not panel_user:
-            _pending_inputs.pop(str(chat_id), None)
+            _pending_inputs.pop(key, None)
             await api.send_message(chat_id, f"❌ {_tt(lang, 'access_denied')}")
             return True
         name = text[:80].strip()
         if not name:
             await api.send_message(chat_id, _tt(lang, "name_empty"))
             return True
-        _pending_inputs.pop(str(chat_id), None)
+        _pending_inputs.pop(key, None)
         await _admin_choose_client_user(api, chat_id, name, int(state.get("sid", 0)), state.get("proto", "awg"), load_data_fn, lang)
         return True
 
     if state.get("kind") == "user_add_client_name":
         panel_user = _find_user(load_data_fn, str(msg["from"]["id"]), msg["from"].get("username"))
         if not panel_user or _is_admin(panel_user):
-            _pending_inputs.pop(str(chat_id), None)
+            _pending_inputs.pop(key, None)
             await api.send_message(chat_id, f"❌ {_tt(lang, 'access_denied')}")
             return True
         name = text[:80].strip()
         if not name:
             await api.send_message(chat_id, _tt(lang, "name_empty"))
             return True
-        _pending_inputs.pop(str(chat_id), None)
+        _pending_inputs.pop(key, None)
         if not self_service_svc:
             await api.send_message(chat_id, f"❌ {_tt(lang, 'self_service_unavailable')}")
             return True
@@ -1459,7 +1468,7 @@ async def _user_create_protocol(api: TelegramAPI, chat_id: int, message_id: int,
 
     await api.answer_callback(callback_id)
 
-    _pending_inputs[str(chat_id)] = {
+    _pending_inputs[_pending_key(chat_id, tg_id)] = {
         "kind": "user_add_client_name",
         "sid": server_id,
         "proto": proto,
@@ -1479,7 +1488,7 @@ async def _user_create_protocol(api: TelegramAPI, chat_id: int, message_id: int,
 
 
 async def _user_create_cancel(api: TelegramAPI, chat_id: int, message_id: int, callback_id: str, tg_id: str, tg_username: Optional[str], load_data_fn: Callable, lang: str = "en"):
-    _pending_inputs.pop(str(chat_id), None)
+    _pending_inputs.pop(_pending_key(chat_id, tg_id), None)
     panel_user = _find_user(load_data_fn, tg_id, tg_username)
     if not panel_user:
         await api.answer_callback(callback_id, text="Access denied")
@@ -1544,7 +1553,7 @@ async def _user_delete_confirm(api: TelegramAPI, chat_id: int, message_id: int, 
         await self_service_svc.delete_user_connection(panel_user["id"], conn_id, "telegram")
     except Exception as e:
         logger.exception("Bot: self-service delete failed")
-        await api.edit_message(chat_id, message_id, f"❌ {_tt(lang, 'error')}: {_e(e)}")
+        await api.edit_message(chat_id, message_id, f"❌ {_tt(lang, 'error')}: {_tt(lang, 'self_service_unavailable')}")
         return
 
     data = load_data_fn()
@@ -1615,7 +1624,7 @@ async def _user_create_connection(api: TelegramAPI, chat_id: int, panel_user: di
                     await api.edit_message(chat_id, loading_msg_id, f"✅ {_tt(lang, 'connection_created_success')}")
     except Exception as e:
         logger.exception("Bot: self-service create failed")
-        await api.send_message(chat_id, f"❌ {_tt(lang, 'error')}: {_e(e)}")
+        await api.send_message(chat_id, f"❌ {_tt(lang, 'error')}: {_tt(lang, 'self_service_unavailable')}")
 
 
 # ----------------------------------------------------------------------- #
@@ -1662,6 +1671,10 @@ async def _dispatch(api: TelegramAPI, update: dict, load_data_fn: Callable, gene
         text = msg.get("text", "")
         tg_username = msg["from"].get("username")
         lang = _tg_lang(msg["from"])
+        chat_id = msg["chat"]["id"]
+        if text.startswith(("/connections", "/connect", "/disconnect")) and not _is_private_chat(msg.get("chat")):
+            await _reject_non_private(api, chat_id, lang)
+            return
         if await _handle_pending_input(api, msg, load_data_fn, save_data_fn, generate_vpn_link_fn, self_service_svc):
             return
         if text.startswith("/start") or text.startswith("/admin"):
@@ -1669,17 +1682,17 @@ async def _dispatch(api: TelegramAPI, update: dict, load_data_fn: Callable, gene
         elif text.startswith("/connections"):
             panel_user = _find_user(load_data_fn, str(msg["from"]["id"]), tg_username)
             if not panel_user:
-                await api.send_message(msg["chat"]["id"], f" {_tt(lang, 'access_denied')}")
+                await api.send_message(chat_id, f" {_tt(lang, 'access_denied')}")
             else:
-                await _send_user_connections(api, msg["chat"]["id"], panel_user, load_data_fn, lang=lang)
+                await _send_user_connections(api, chat_id, panel_user, load_data_fn, lang=lang)
         elif text.startswith("/connect"):
-            await _user_create_start_message(api, msg["chat"]["id"], str(msg["from"]["id"]), tg_username, load_data_fn, lang)
+            await _user_create_start_message(api, chat_id, str(msg["from"]["id"]), tg_username, load_data_fn, lang)
         elif text.startswith("/disconnect"):
             panel_user = _find_user(load_data_fn, str(msg["from"]["id"]), tg_username)
             if not panel_user:
-                await api.send_message(msg["chat"]["id"], f" {_tt(lang, 'access_denied')}")
+                await api.send_message(chat_id, f" {_tt(lang, 'access_denied')}")
             else:
-                await _send_user_connections(api, msg["chat"]["id"], panel_user, load_data_fn, lang=lang)
+                await _send_user_connections(api, chat_id, panel_user, load_data_fn, lang=lang)
         elif text.startswith("/servers"):
             if _require_admin(load_data_fn, str(msg["from"]["id"]), tg_username):
                 await _admin_servers(api, msg["chat"]["id"], None, load_data_fn, lang)
@@ -1693,6 +1706,7 @@ async def _dispatch(api: TelegramAPI, update: dict, load_data_fn: Callable, gene
         callback_id = cq["id"]
         data_str = cq.get("data", "")
         chat_id = cq["message"]["chat"]["id"]
+        chat = cq["message"].get("chat", {})
         message_id = cq["message"]["message_id"]
         tg_id = str(cq["from"]["id"])
         tg_username = cq["from"].get("username")
@@ -1705,11 +1719,17 @@ async def _dispatch(api: TelegramAPI, update: dict, load_data_fn: Callable, gene
             await _handle_refresh(api, chat_id, message_id, callback_id, tg_id, tg_username, load_data_fn, lang)
             return
         if data_str.startswith("cfg:"):
+            if not _is_private_chat(chat):
+                await _reject_non_private(api, chat_id, lang, callback_id)
+                return
             await _handle_get_config(api, chat_id, message_id, callback_id, data_str[4:], tg_id, tg_username, load_data_fn, generate_vpn_link_fn, lang)
             return
 
         # Self-service user callbacks (before admin gate).
         if data_str == "user_create":
+            if not _is_private_chat(chat):
+                await _reject_non_private(api, chat_id, lang, callback_id)
+                return
             await _user_create_start(api, chat_id, message_id, callback_id, tg_id, tg_username, load_data_fn, self_service_svc, lang)
             return
         if data_str == "user_create_cancel":
@@ -1721,18 +1741,33 @@ async def _dispatch(api: TelegramAPI, update: dict, load_data_fn: Callable, gene
             action = ref.get("action")
             payload = ref.get("payload", {})
             if action == "user_create_server":
+                if not _is_private_chat(chat):
+                    await _reject_non_private(api, chat_id, lang, callback_id)
+                    return
                 await _user_create_server(api, chat_id, message_id, callback_id, tg_id, tg_username, int(payload.get("sid", 0)), load_data_fn, self_service_svc, lang)
                 return
             if action == "user_create_protocol":
+                if not _is_private_chat(chat):
+                    await _reject_non_private(api, chat_id, lang, callback_id)
+                    return
                 await _user_create_protocol(api, chat_id, message_id, callback_id, tg_id, tg_username, int(payload.get("sid", 0)), payload.get("proto", "awg"), load_data_fn, lang)
                 return
             if action == "user_add_client":
+                if not _is_private_chat(chat):
+                    await _reject_non_private(api, chat_id, lang, callback_id)
+                    return
                 await _user_add_client_final(api, chat_id, message_id, callback_id, tg_id, tg_username, int(payload.get("sid", 0)), payload.get("proto", "awg"), payload.get("name", ""), load_data_fn, generate_vpn_link_fn, self_service_svc, lang)
                 return
             if action == "user_delete":
+                if not _is_private_chat(chat):
+                    await _reject_non_private(api, chat_id, lang, callback_id)
+                    return
                 await _user_delete(api, chat_id, message_id, callback_id, tg_id, tg_username, payload.get("conn_id", ""), payload.get("name", ""), load_data_fn, lang)
                 return
             if action == "user_delete_confirm":
+                if not _is_private_chat(chat):
+                    await _reject_non_private(api, chat_id, lang, callback_id)
+                    return
                 await _user_delete_confirm(api, chat_id, message_id, callback_id, tg_id, tg_username, payload.get("conn_id", ""), load_data_fn, self_service_svc, lang)
                 return
 
@@ -1781,11 +1816,14 @@ async def _dispatch(api: TelegramAPI, update: dict, load_data_fn: Callable, gene
             elif action == "client":
                 await _admin_client_detail(api, chat_id, message_id, sid, proto, payload.get("client", {}), lang)
             elif action == "client_cfg":
+                if not _is_private_chat(chat):
+                    await _reject_non_private(api, chat_id, lang, callback_id)
+                    return
                 data = load_data_fn()
                 server = data["servers"][sid]
                 await _send_config_by_client(api, chat_id, server, proto, payload.get("client_id"), payload.get("name", "Connection"), generate_vpn_link_fn, lang)
             elif action == "add_client":
-                await _admin_add_client(api, chat_id, message_id, sid, proto, panel_user, load_data_fn, save_data_fn, generate_vpn_link_fn, lang)
+                await _admin_add_client(api, chat_id, message_id, sid, proto, panel_user, load_data_fn, save_data_fn, generate_vpn_link_fn, lang, tg_id)
             elif action == "create_client":
                 await _admin_create_client(api, chat_id, message_id, sid, proto, payload.get("name", "Connection"), payload.get("user_id"), load_data_fn, save_data_fn, generate_vpn_link_fn, lang)
             elif action == "toggle_client":

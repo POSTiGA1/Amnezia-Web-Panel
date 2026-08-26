@@ -150,6 +150,18 @@
     let ssOptions = null;
     let allConnections = [];
 
+    function escapeHtml(value) {
+        return String(value ?? '').replace(/[&<>"']/g, ch => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[ch]));
+    }
+
+    function escapeJs(value) {
+        return String(value ?? '').replace(/[\\'"\n\r<>]/g, ch => ({
+            '\\': '\\\\', "'": "\\'", '"': '\\"', '\n': '\\n', '\r': '\\r', '<': '\\x3c', '>': '\\x3e'
+        }[ch]));
+    }
+
     function getProtocolLabel(proto) {
         const labels = {
             awg: 'AmneziaWG',
@@ -204,21 +216,21 @@
             <div class="client-item" style="display: flex; align-items: center; padding: var(--space-md);">
                 <div class="client-avatar" style="width: 48px; height: 48px; display: flex; align-items: center; justify-content: center; background: linear-gradient(135deg, #6366f1, #8b5cf6); color: white; border-radius: var(--radius-md); font-size: 1.5rem; flex-shrink: 0;">🔗</div>
                 <div style="margin-left: var(--space-md); flex: 1; min-width: 0;">
-                    <div class="client-name" style="margin-bottom: 4px;">${(c.name || _('my_connections_title')).replace(/</g, '&lt;')}</div>
+                    <div class="client-name" style="margin-bottom: 4px;">${escapeHtml(c.name || _('my_connections_title'))}</div>
                     <div class="client-meta" style="display: flex; align-items: center; gap: var(--space-sm); flex-wrap: wrap;">
-                        <span>🖥 ${c.server_name || '—'}</span>
-                        <span style="color: var(--text-muted);">${getProtocolLabel(c.protocol)}</span>
+                        <span>🖥 ${escapeHtml(c.server_name || '—')}</span>
+                        <span style="color: var(--text-muted);">${escapeHtml(getProtocolLabel(c.protocol))}</span>
                     </div>
                 </div>
                 <button class="btn btn-secondary btn-sm btn-icon"
-                    onclick="showMyConfig('${c.id}', '${(c.name || 'Connection').replace(/'/g, "\\'")}', '${c.protocol}')"
+                    onclick="showMyConfig('${escapeJs(c.id)}', '${escapeJs(c.name || 'Connection')}', '${escapeJs(c.protocol)}')"
                     title="${_('show_config')}"
                     style="margin-left: var(--space-md); flex-shrink: 0; width: 40px; height: 40px; display: flex; align-items: center; justify-content: center;">
                     📄
                 </button>
                 ${c.created_by === 'self_service'
                     ? `<button class="btn btn-danger btn-sm btn-icon"
-                        onclick="deleteConnection('${c.id}', '${(c.name || 'Connection').replace(/'/g, "\\'")}')",
+                        onclick="deleteConnection('${escapeJs(c.id)}', '${escapeJs(c.name || 'Connection')}')"
                         title="${_('delete_connection')}"
                         style="margin-left: var(--space-sm); flex-shrink: 0; width: 40px; height: 40px; display: flex; align-items: center; justify-content: center;">🗑</button>`
                     : ''}

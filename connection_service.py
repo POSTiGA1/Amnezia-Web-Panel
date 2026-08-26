@@ -6,6 +6,7 @@ from collections import defaultdict
 from datetime import datetime
 
 MAX_CONNECTION_NAME_LENGTH = 64
+DISALLOWED_CONNECTION_NAME_CHARS = set('<>"\'&')
 
 logger = logging.getLogger(__name__)
 
@@ -88,107 +89,118 @@ class ConnectionService:
     async def create_user_connection(self, user_id, server_id, protocol, name, source):
         clean_name = self._validate_name(name)
         self._validate_protocol(protocol)
-        data = self.load_data()
-        settings = self._settings(data)
-        self._validate_create_request(data, settings, user_id, server_id, protocol, clean_name, source)
-        self._check_rate_limit(user_id, source, settings)
-
         lock = self._provision_locks[(server_id, protocol)]
         async with lock:
             async with self.data_lock:
                 data = self.load_data()
                 settings = self._settings(data)
-                user = self._validate_create_request(data, settings, user_id, server_id, protocol, clean_name, source)
                 self._check_rate_limit(user_id, source, settings)
-                server = data['servers'][server_id]
+                self._record_rate_event(user_id, source)
+                self._validate_create_request(data, settings, user_id, server_id, protocol, clean_name, source)
+                server = dict(data['servers'][server_id])
                 port = server.get('protocols', {}).get(protocol, {}).get('port', '55424')
-                ssh = self.get_ssh(server)
-                remote_client_id = None
-                manager = None
+
+            ssh = self.get_ssh(server)
+            remote_client_id = None
+            manager = None
+            try:
+                await asyncio.to_thread(ssh.connect)
+                manager = self.get_protocol_manager(ssh, protocol)
+                result = await asyncio.to_thread(
+                    self.manager_call,
+                    manager,
+                    'add_client',
+                    protocol,
+                    clean_name,
+                    server.get('host', ''),
+                    port,
+                )
+                remote_client_id = result.get('client_id')
+                if not remote_client_id:
+                    raise RuntimeError('Remote client creation did not return client_id')
+
                 try:
-                    await asyncio.to_thread(ssh.connect)
-                    manager = self.get_protocol_manager(ssh, protocol)
-                    result = await asyncio.to_thread(
-                        self.manager_call,
-                        manager,
-                        'add_client',
-                        protocol,
-                        clean_name,
-                        server.get('host', ''),
-                        port,
-                    )
-                    remote_client_id = result.get('client_id')
-                    if not remote_client_id:
-                        raise RuntimeError('Remote client creation did not return client_id')
-                    conn = {
-                        'id': str(uuid.uuid4()),
-                        'user_id': user['id'],
-                        'server_id': server_id,
-                        'protocol': protocol,
-                        'client_id': remote_client_id,
-                        'name': clean_name,
-                        'created_at': datetime.now().isoformat(),
-                        'created_by': 'self_service',
-                        'created_source': source,
-                    }
-                    data.setdefault('user_connections', []).append(conn)
-                    try:
+                    async with self.data_lock:
+                        data = self.load_data()
+                        settings = self._settings(data)
+                        user = self._validate_create_request(data, settings, user_id, server_id, protocol, clean_name, source)
+                        conn = {
+                            'id': str(uuid.uuid4()),
+                            'user_id': user['id'],
+                            'server_id': server_id,
+                            'protocol': protocol,
+                            'client_id': remote_client_id,
+                            'name': clean_name,
+                            'created_at': datetime.now().isoformat(),
+                            'created_by': 'self_service',
+                            'created_source': source,
+                        }
+                        data.setdefault('user_connections', []).append(conn)
                         self.save_data(data)
-                    except Exception:
-                        await self._rollback_client(manager, protocol, remote_client_id)
-                        remote_client_id = None
-                        raise
-                    self._record_rate_event(user_id, source)
-                    response = {'status': 'success', 'connection': conn}
-                    if result.get('config'):
-                        response['config'] = result['config']
-                        response['vpn_link'] = self.generate_vpn_link(result['config'])
-                    return response
                 except Exception:
-                    if remote_client_id:
-                        await self._rollback_client(manager, protocol, remote_client_id)
+                    await self._rollback_client(manager, protocol, remote_client_id)
+                    remote_client_id = None
                     raise
-                finally:
-                    try:
-                        await asyncio.to_thread(ssh.disconnect)
-                    except Exception:
-                        pass
+
+                response = {'status': 'success', 'connection': conn}
+                if result.get('config'):
+                    response['config'] = result['config']
+                    response['vpn_link'] = self.generate_vpn_link(result['config'])
+                return response
+            except Exception:
+                if remote_client_id:
+                    await self._rollback_client(manager, protocol, remote_client_id)
+                raise
+            finally:
+                try:
+                    await asyncio.to_thread(ssh.disconnect)
+                except Exception:
+                    pass
 
     async def delete_user_connection(self, user_id, connection_id, source):
         data = self.load_data()
         settings = self._settings(data)
+        self._check_rate_limit(user_id, source, settings)
+        self._record_rate_event(user_id, source)
         self._validate_channel(settings, source)
         self._get_eligible_user(data, user_id)
         conn = self._get_connection(data, user_id, connection_id)
-        if conn.get('created_by') != 'self_service':
-            raise SelfServiceError('Only self-service connections can be deleted', status_code=403, forbidden=True)
         server_id = conn.get('server_id')
         protocol = conn.get('protocol')
         lock = self._provision_locks[(server_id, protocol)]
         async with lock:
             async with self.data_lock:
                 data = self.load_data()
-                self._validate_channel(self._settings(data), source)
+                settings = self._settings(data)
+                self._validate_channel(settings, source)
                 self._get_eligible_user(data, user_id)
                 conn = self._get_connection(data, user_id, connection_id)
                 if conn.get('created_by') != 'self_service':
                     raise SelfServiceError('Only self-service connections can be deleted', status_code=403, forbidden=True)
                 if server_id is None or server_id >= len(data.get('servers', [])):
                     raise SelfServiceError('Server not found', status_code=404)
-                server = data['servers'][server_id]
-                ssh = self.get_ssh(server)
+                server = dict(data['servers'][server_id])
+
+            ssh = self.get_ssh(server)
+            try:
+                await asyncio.to_thread(ssh.connect)
+                manager = self.get_protocol_manager(ssh, protocol)
+                await asyncio.to_thread(self.manager_call, manager, 'remove_client', protocol, conn.get('client_id'))
+            finally:
                 try:
-                    await asyncio.to_thread(ssh.connect)
-                    manager = self.get_protocol_manager(ssh, protocol)
-                    await asyncio.to_thread(self.manager_call, manager, 'remove_client', protocol, conn.get('client_id'))
-                    data['user_connections'] = [c for c in data.get('user_connections', []) if c.get('id') != connection_id]
-                    self.save_data(data)
-                    return {'status': 'success'}
-                finally:
-                    try:
-                        await asyncio.to_thread(ssh.disconnect)
-                    except Exception:
-                        pass
+                    await asyncio.to_thread(ssh.disconnect)
+                except Exception:
+                    pass
+
+            async with self.data_lock:
+                data = self.load_data()
+                self._validate_channel(self._settings(data), source)
+                conn = self._get_connection(data, user_id, connection_id)
+                if conn.get('created_by') != 'self_service':
+                    raise SelfServiceError('Only self-service connections can be deleted', status_code=403, forbidden=True)
+                data['user_connections'] = [c for c in data.get('user_connections', []) if c.get('id') != connection_id]
+                self.save_data(data)
+            return {'status': 'success'}
 
     def _settings(self, data):
         settings = dict(DEFAULT_SELF_SERVICE_SETTINGS)
@@ -220,6 +232,7 @@ class ConnectionService:
                 raise
             except Exception as e:
                 logger.warning("Failed to parse expiration_date '%s': %s", expiration, e)
+                raise SelfServiceError('User expiration date is invalid', status_code=403, forbidden=True)
         limit = int(user.get('traffic_limit') or 0)
         used = int(user.get('traffic_used') or 0)
         if limit > 0 and used >= limit:
@@ -249,8 +262,13 @@ class ConnectionService:
 
     def _validate_name(self, name):
         clean = str(name or '').strip()
-        if not clean or len(clean) > MAX_CONNECTION_NAME_LENGTH or any(ord(ch) < 32 or ord(ch) == 127 for ch in clean):
-            raise SelfServiceError('Connection name must be 1-64 characters without control characters')
+        if (
+            not clean
+            or len(clean) > MAX_CONNECTION_NAME_LENGTH
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in clean)
+            or any(ch in DISALLOWED_CONNECTION_NAME_CHARS for ch in clean)
+        ):
+            raise SelfServiceError('Connection name must be 1-64 characters without control or HTML-sensitive characters')
         return clean
 
     def _validate_protocol(self, protocol):
@@ -273,15 +291,15 @@ class ConnectionService:
         count = int(settings.get('rate_limit_count', 3))
         window = int(settings.get('rate_limit_window_seconds', 60))
         if count <= 0 or window <= 0:
-            return
-        key = (source, user_id)
+            raise RateLimitError()
+        key = user_id
         now = time.monotonic()
         self._rate_events[key] = [ts for ts in self._rate_events[key] if now - ts < window]
         if len(self._rate_events[key]) >= count:
             raise RateLimitError()
 
     def _record_rate_event(self, user_id, source):
-        self._rate_events[(source, user_id)].append(time.monotonic())
+        self._rate_events[user_id].append(time.monotonic())
 
     async def _rollback_client(self, manager, protocol, client_id):
         try:
