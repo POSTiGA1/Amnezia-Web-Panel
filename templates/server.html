@@ -2070,10 +2070,6 @@
                 if (assignedUser) metaHtml += `<span class="badge badge-info" style="font-size:0.65rem;">👤 ${escapeHtml(assignedUser)}</span>`;
                 if (created) metaHtml += `<span>📅 ${formatDate(created)}</span>`;
 
-                // Peer internal IP shown next to the name
-                const peerIp = userData.clientIp || ((userData.allowedIps || '').match(/(\d+\.\d+\.\d+\.\d+)/) || [])[1] || '';
-                const ipHtml = peerIp ? ` <span class="client-ip">${escapeHtml(peerIp)}</span>` : '';
-
                 // Connection flood warnings (P2P/torrent detection), newest last
                 let warningsHtml = '';
                 if (Array.isArray(userData.connWarnings) && userData.connWarnings.length) {
@@ -2117,7 +2113,7 @@
                         <div class="client-info">
                             <div class="client-avatar${client._online ? ' avatar-online' : ''}">${initial}</div>
                             <div>
-                                <div class="client-name">${escapeHtml(name)}${ipHtml}</div>
+                                <div class="client-name">${escapeHtml(name)}</div>
                                 <div class="client-meta">${metaHtml || `<span class="text-muted">${_('no_data')}</span>`}</div>
                                 ${warningsHtml}
                             </div>
