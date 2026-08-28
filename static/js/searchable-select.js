@@ -42,6 +42,10 @@
         trigger.type = 'button';
         trigger.className = 'form-select searchable-select-trigger';
         trigger.setAttribute('aria-haspopup', 'listbox');
+        // Option text is user data (names, emails) and may run counter to the
+        // page direction; let the browser pick per string instead of forcing
+        // the UI direction onto it.
+        trigger.setAttribute('dir', 'auto');
         trigger.setAttribute('aria-expanded', 'false');
         if (select.id) {
             trigger.setAttribute('aria-labelledby', select.id + '-label');
@@ -59,6 +63,7 @@
         search.className = 'form-input';
         search.autocomplete = 'off';
         search.spellcheck = false;
+        search.setAttribute('dir', 'auto');
         search.placeholder = select.dataset.searchPlaceholder || 'Search...';
         search.setAttribute('aria-controls', this.id + '-list');
         searchWrap.appendChild(search);
@@ -130,6 +135,7 @@
             var item = document.createElement('div');
             item.className = 'searchable-select-option';
             item.setAttribute('role', 'option');
+            item.setAttribute('dir', 'auto');
             item.id = self.id + '-opt-' + index;
             item.textContent = textOf(option);   // textContent: never trust option text as HTML
             item.dataset.index = String(index);
