@@ -309,6 +309,9 @@ a:hover {
     align-items: center;
     justify-content: center;
     gap: var(--space-sm);
+    /* symbol glyphs like U+23F9 fall back to a font with much taller metrics,
+       which stretches the line box downwards and leaves the label riding high */
+    line-height: 1;
     padding: 10px 20px;
     border: none;
     border-radius: var(--radius-md);
@@ -1631,20 +1634,24 @@ a:hover {
     display: block;
 }
 
-/* The header row is space-between, so with three control buttons the group
-   ran straight into the protocol icon. Keep a gap and let it wrap instead. */
+/* Icon and protocol name share the top row; the control buttons get a row of
+   their own below it, where three of them fit without crowding the icon. */
 .protocol-card-head {
     display: flex;
     align-items: center;
-    justify-content: space-between;
     gap: var(--space-sm);
     margin-bottom: var(--space-sm);
 }
 
+.protocol-card-head .protocol-icon,
+.protocol-card-head .protocol-name {
+    margin-bottom: 0;
+}
+
 .protocol-ctrl {
     flex-wrap: wrap;
-    justify-content: flex-end;
     row-gap: var(--space-xs);
+    margin-bottom: var(--space-md);
 }
 
 /* ===== QR Code ===== */
@@ -1656,9 +1663,23 @@ a:hover {
     padding: var(--space-lg);
 }
 
-.qr-container canvas {
+/* qrcode.js paints the modules edge to edge with no quiet zone. On the dark
+   page that leaves the finder patterns touching the background, and decoders
+   then refuse the code outright -- at any size. This white frame is the quiet
+   zone, and it has to stay at least four modules wide. */
+#qrCode {
+    background: #ffffff;
+    padding: 32px;
     border-radius: var(--radius-md);
     box-shadow: 0 0 30px rgba(139, 92, 246, 0.15);
+    line-height: 0;
+}
+
+/* rounding the code itself would clip the corner finder patterns */
+.qr-container canvas,
+.qr-container img {
+    border-radius: 0;
+    display: block;
 }
 
 .qr-hint {
