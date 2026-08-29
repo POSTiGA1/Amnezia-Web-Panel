@@ -120,7 +120,7 @@
   "qr_hint": "Scannez le code QR dans l'application AmneziaVPN",
   "qr_format_amnezia": "Amnezia",
   "qr_format_wireguard": "WireGuard",
-  "qr_format_amnezia_hint": "Transmet le nom du serveur — AmneziaVPN uniquement. Plus dense, rapprochez la caméra.",
+  "qr_format_amnezia_hint": "Série animée pour AmneziaVPN, transmet le nom du serveur. Gardez la caméra jusqu'à ce que toutes les images soient lues —",
   "qr_format_wireguard_hint": "Configuration simple pour AmneziaWG et wg-quick. Le nom du serveur n'est pas transmis.",
   "no_data": "Aucune donnée",
   "start_btn": "▶ Start",

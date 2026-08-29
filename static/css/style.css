@@ -1631,6 +1631,22 @@ a:hover {
     display: block;
 }
 
+/* The header row is space-between, so with three control buttons the group
+   ran straight into the protocol icon. Keep a gap and let it wrap instead. */
+.protocol-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-sm);
+    margin-bottom: var(--space-sm);
+}
+
+.protocol-ctrl {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    row-gap: var(--space-xs);
+}
+
 /* ===== QR Code ===== */
 .qr-container {
     display: flex;

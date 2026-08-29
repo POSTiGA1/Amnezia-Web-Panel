@@ -120,7 +120,7 @@
   "qr_hint": "کد QR را در برنامه AmneziaVPN اسکن کنید",
   "qr_format_amnezia": "Amnezia",
   "qr_format_wireguard": "WireGuard",
-  "qr_format_amnezia_hint": "نام سرور را منتقل می‌کند — فقط برای AmneziaVPN. متراکم‌تر است، دوربین را نزدیک‌تر بگیرید.",
+  "qr_format_amnezia_hint": "مجموعه متحرک برای AmneziaVPN، نام سرور را منتقل می‌کند. دوربین را نگه دارید تا همه فریم‌ها خوانده شوند —",
   "qr_format_wireguard_hint": "پیکربندی ساده برای AmneziaWG و wg-quick. نام سرور منتقل نمی‌شود.",
   "no_data": "بدون داده",
   "start_btn": "▶ شروع",

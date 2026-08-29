@@ -1174,21 +1174,64 @@ def build_amnezia_config(config_text, description):
     return config
 
 
-def amnezia_vpn_key(config_text, description):
-    """base64url(qCompress(json)) -- the payload half of an Amnezia `vpn://` key.
+def amnezia_config_bytes(config_text, description):
+    """qCompress(json) -- what an Amnezia `vpn://` key and QR series both carry.
 
     qCompress prepends the uncompressed size as a big-endian uint32 and
     qUncompress refuses anything without it. Empty when the config is not a
     WireGuard/AmneziaWG one, so callers fall back to the plain key.
     """
     if not description:
-        return ''
+        return b''
     config = build_amnezia_config(config_text, description)
     if not config:
-        return ''
+        return b''
     raw = json.dumps(config, indent=4).encode('utf-8')
-    compressed = struct.pack('>I', len(raw)) + zlib.compress(raw, 8)
-    return base64.urlsafe_b64encode(compressed).decode('utf-8').rstrip('=')
+    return struct.pack('>I', len(raw)) + zlib.compress(raw, 8)
+
+
+def amnezia_vpn_key(config_text, description):
+    """The payload half of an Amnezia `vpn://` key."""
+    payload = amnezia_config_bytes(config_text, description)
+    if not payload:
+        return ''
+    return base64.urlsafe_b64encode(payload).decode('utf-8').rstrip('=')
+
+
+# ImportController::parseQrCodeChunk reassembles a scanned config from a series
+# of framed chunks: a QDataStream carrying qint16 magic, quint8 total, quint8
+# index and the payload slice as a QByteArray (quint32 length + bytes), the
+# whole frame base64url'd into one QR code.
+QR_MAGIC = 1984
+
+# The Android scanner (CameraActivity.kt) builds `ImageAnalysis.Builder().build()`
+# with no ResolutionSelector, so CameraX hands ML Kit 640x480 frames -- which is
+# why a whole config in one code never scanned: it lands at version 19 raw or 26
+# wrapped, around 2-3 px per module in such a frame. 144 bytes keeps every frame
+# at version 8-9, under 55x55 modules, which survived a simulated VGA capture
+# down to a QR filling only 40% of the frame height.
+QR_CHUNK_SIZE = 144
+
+# quint8 chunk counter on the reading side.
+QR_MAX_CHUNKS = 255
+
+
+def amnezia_qr_chunks(config_text, description):
+    """Split the config into QR frames the client can reassemble."""
+    payload = amnezia_config_bytes(config_text, description)
+    if not payload:
+        return []
+    total = (len(payload) + QR_CHUNK_SIZE - 1) // QR_CHUNK_SIZE
+    if total > QR_MAX_CHUNKS:
+        return []
+    # spread the bytes evenly rather than leaving a stub last frame
+    size = (len(payload) + total - 1) // total
+    chunks = []
+    for index in range(total):
+        part = payload[index * size:(index + 1) * size]
+        frame = struct.pack('>hBBI', QR_MAGIC, total, index, len(part)) + part
+        chunks.append(base64.urlsafe_b64encode(frame).decode('utf-8').rstrip('='))
+    return chunks
 
 
 def generate_vpn_link(config_text, server=None, protocol=None):
@@ -1208,21 +1251,21 @@ def generate_vpn_link(config_text, server=None, protocol=None):
 
 
 def config_payloads(config_text, server=None, protocol=None):
-    """The three things every config view needs: key, QR payload, server name.
+    """The three things every config view needs: key, QR frames, server name.
 
-    `vpn_qr` deliberately carries no `vpn://` prefix -- extractConfigFromQr()
-    hands the scanned text straight to QByteArray::fromBase64, which drops ':'
-    and '/' but keeps 'v', 'p' and 'n', shifting the whole payload by three
-    characters. Empty when the config is not a WireGuard/AmneziaWG one; the QR
+    The frames carry no `vpn://` prefix -- extractConfigFromQr() hands the
+    scanned text straight to QByteArray::fromBase64, which drops ':' and '/'
+    but keeps 'v', 'p' and 'n', shifting the whole payload by three characters.
+    The list is empty when the config is not a WireGuard/AmneziaWG one; the QR
     then stays on the raw config, which is all such clients understand anyway.
     """
     name = connection_display_name(server, protocol)
     if not str(config_text or '').strip():
-        return {'vpn_link': '', 'vpn_qr': '', 'vpn_name': name}
+        return {'vpn_link': '', 'vpn_qr_chunks': [], 'vpn_name': name}
     key = amnezia_vpn_key(config_text, name)
     return {
         'vpn_link': f"vpn://{key}" if key else generate_vpn_link(config_text),
-        'vpn_qr': key,
+        'vpn_qr_chunks': amnezia_qr_chunks(config_text, name),
         'vpn_name': name,
     }
 
