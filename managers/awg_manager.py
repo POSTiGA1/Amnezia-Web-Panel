@@ -1779,11 +1779,15 @@ AllowedIPs = {allowed_ips}
                 return None
             return stripped.partition('=')[0].strip()
 
+        # A None means "leave this alone"; an empty string means "clear it",
+        # which drops the line so the built-in default applies again.
         replaced = {}
         if mtu is not None:
-            replaced['MTU'] = f"# MTU = {str(mtu).strip()}"
+            value = str(mtu).strip()
+            replaced['MTU'] = f"# MTU = {value}" if value else None
         if dns is not None:
-            replaced['DNS'] = f"# DNS = {str(dns).strip()}"
+            value = str(dns).strip()
+            replaced['DNS'] = f"# DNS = {value}" if value else None
         if junk is not None:
             for key in SPECIAL_JUNK_KEYS:
                 value = junk.get(key)
@@ -1802,7 +1806,10 @@ AllowedIPs = {allowed_ips}
             head.pop()
         head.extend(value for value in replaced.values() if value)
 
-        self._write_server_config(protocol_type, '\n'.join(head + lines[interface_end:]))
+        tail = lines[interface_end:]
+        if tail:
+            head.append('')  # keep [Interface] and [Peer] visually apart
+        self._write_server_config(protocol_type, '\n'.join(head + tail))
 
         if junk is not None:
             # There is no way to spell an empty I1-I5 in a config file
@@ -1865,8 +1872,8 @@ AllowedIPs = {allowed_ips}
     def save_client_config(self, protocol_type, client_id, config_text):
         """Persist a manually edited client config. Stored verbatim in
         clientsTable (userData.customConfig) and returned by get_client_config
-        from now on; the DNS line is indexed into userData.dns as the
-        per-client override for future regenerations."""
+        from now on; the DNS and MTU lines are indexed into userData as the
+        per-client overrides _get_dns/_get_mtu read on future regenerations."""
         config_text = (config_text or '').strip()
         if not config_text:
             raise RuntimeError('Config is empty')
@@ -1877,11 +1884,16 @@ AllowedIPs = {allowed_ips}
         ud = client.setdefault('userData', {})
         ud['customConfig'] = config_text
         ud.pop('dns', None)
+        ud.pop('mtu', None)
+        indexed = {'DNS': 'dns', 'MTU': 'mtu'}
         for line in config_text.split('\n'):
             stripped = line.strip()
-            if stripped.startswith('DNS') and '=' in stripped:
-                ud['dns'] = stripped.split('=', 1)[1].strip()
-                break
+            if stripped.startswith('#') or '=' not in stripped:
+                continue
+            name, _, value = stripped.partition('=')
+            field = indexed.get(name.strip())
+            if field and value.strip():
+                ud[field] = value.strip()
         self._save_clients_table(protocol_type, clients_table)
         return {'status': 'success'}
 

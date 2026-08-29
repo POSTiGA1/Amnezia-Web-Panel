@@ -1645,11 +1645,29 @@ def get_current_user(request: Request):
     return None
 
 
+def static_version():
+    """Cache buster for /static: the newest mtime under it.
+
+    Browsers hold on to style.css across a redeploy -- it is served with an
+    ETag but no Cache-Control, so heuristic caching keeps a stale copy and the
+    page renders new markup against old rules.
+    """
+    newest = 0.0
+    for root, _dirs, files in os.walk(os.path.join(application_path, 'static')):
+        for name in files:
+            try:
+                newest = max(newest, os.path.getmtime(os.path.join(root, name)))
+            except OSError:
+                continue
+    return str(int(newest))
+
+
 def tpl(request, template, **kwargs):
     data = load_data()
     lang = request.cookies.get('lang', 'en')
     ctx = {
         'request': request,
+        'static_v': static_version(),
         'current_user': get_current_user(request),
         'site_settings': data.get('settings', {}).get('appearance', {}),
         'captcha_settings': data.get('settings', {}).get('captcha', {}),
@@ -3080,10 +3098,16 @@ async def api_awg_settings_save(request: Request, server_id: int, req: AwgSettin
         ssh = get_ssh(server)
         ssh.connect()
         try:
+            # An empty string means "clear it", None means "leave it alone";
+            # join_dns() collapses two blank fields to None, so restore the
+            # distinction here or the DNS could never be reset from the UI.
+            dns = None
+            if req.dns1 is not None or req.dns2 is not None:
+                dns = join_dns(req.dns1, req.dns2) or ''
             settings = AWGManager(ssh).update_awg_settings(
                 req.protocol,
                 mtu=req.mtu,
-                dns=join_dns(req.dns1, req.dns2),
+                dns=dns,
                 special_junk=special_junk,
             )
         finally:

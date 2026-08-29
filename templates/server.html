@@ -604,7 +604,7 @@
                         <label class="form-label" style="display:flex; justify-content:space-between; align-items:center;">
                             {{ _('awg_special_junk') }}
                             <button type="button" class="btn btn-secondary btn-sm"
-                                onclick="resetSpecialJunkFields('install')">{{ _('awg_special_junk_reset') }}</button>
+                                onclick="resetSpecialJunkFields('installAwg')">{{ _('awg_special_junk_reset') }}</button>
                         </label>
                         <div class="form-hint" style="margin-bottom:var(--space-xs);">{{ _('awg_special_junk_hint') }}</div>
                         <input class="form-input" type="text" id="installAwgI1" spellcheck="false" placeholder="I1">
@@ -1081,8 +1081,10 @@
     // Same value the desktop client ships as its default I1.
     const AWG_DEFAULT_I1 = '<r 2><b 0x858000010001000000000669636c6f756403636f6d0000010001c00c000100010000105a00044d583737>';
 
+    // The install form and the settings modal name their inputs differently
+    // (installAwgI1 vs awgSetI1), so callers pass the whole id prefix.
     function specialJunkField(prefix, key) {
-        return document.getElementById(prefix + 'Awg' + key.toUpperCase());
+        return document.getElementById(prefix + key.toUpperCase());
     }
 
     function resetSpecialJunkFields(prefix) {
@@ -1901,7 +1903,7 @@
             document.getElementById('installAwgMtu').value = '1376';
             document.getElementById('installAwgDns1').value = '1.1.1.1';
             document.getElementById('installAwgDns2').value = '1.0.0.1';
-            resetSpecialJunkFields('install');
+            resetSpecialJunkFields('installAwg');
         }
 
         document.getElementById('installForm').classList.remove('hidden');
@@ -1969,7 +1971,7 @@
                 params.awg_dns2 = document.getElementById('installAwgDns2').value.trim();
                 if (protoBase(currentInstallProto) !== 'awg_legacy') {
                     ['i1', 'i2', 'i3', 'i4', 'i5'].forEach(key => {
-                        params['awg_' + key] = document.getElementById('installAwg' + key.toUpperCase()).value.trim();
+                        params['awg_' + key] = specialJunkField('installAwg', key).value.trim();
                     });
                 }
             }
