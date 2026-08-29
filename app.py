@@ -19,6 +19,8 @@ import time
 import urllib.request
 import zipfile
 import signal
+import struct
+import zlib
 from datetime import datetime, timedelta
 import io
 from fastapi.responses import JSONResponse, RedirectResponse, HTMLResponse, StreamingResponse, FileResponse
@@ -1054,7 +1056,142 @@ def awg_special_junk_from(req):
     return values
 
 
-def generate_vpn_link(config_text):
+# Keys the desktop client treats as AmneziaWG-specific -- configKey::awgProtocolKeys()
+# in client/core/utils/constants/configKeys.h. One of them in a config is what makes
+# the client pick the awg container over the plain wireguard one.
+AWG_CONFIG_KEYS = (
+    'Jc', 'Jmin', 'Jmax', 'S1', 'S2', 'S3', 'S4', 'H1', 'H2', 'H3', 'H4',
+    'I1', 'I2', 'I3', 'I4', 'I5',
+    'HeaderProtectionKey', 'ContentPaddingAddition', 'RekeyAfterTime', 'RekeyTimeout',
+    'RejectAfterTime', 'KeepaliveTimeout', 'MaxHandshakeAttempts', 'RandomTrailers',
+    'DisableCookies',
+)
+
+
+def protocol_short_name(protocol: str) -> str:
+    """Short protocol tag for the server name, e.g. `AWG3`."""
+    base = protocol_base(protocol)
+    idx = protocol_instance(protocol)
+    names = {
+        'awg': 'AWG',
+        'awg2': 'AWG2',
+        'awg3': 'AWG3',
+        'awg_legacy': 'AWG-Legacy',
+        'wireguard': 'WG',
+        'xray': 'Xray',
+        'telemt': 'Telemt',
+        'socks5': 'SOCKS5',
+        'dns': 'DNS',
+        'adguard': 'AdGuard',
+        'nginx': 'NGINX',
+    }
+    name = names.get(base, base.upper())
+    return name if idx <= 1 else f'{name}#{idx}'
+
+
+def connection_display_name(server=None, protocol=None) -> str:
+    """`<node> <container>`, e.g. `nl-01 AWG3` -- the name the client will show."""
+    node = str((server or {}).get('name') or (server or {}).get('host') or '').strip()
+    tag = protocol_short_name(protocol) if protocol else ''
+    return ' '.join(part for part in (node, tag) if part)
+
+
+def parse_wg_config(config_text):
+    """Read a WireGuard/AmneziaWG config the way the client's importer does:
+    section headers ignored, every `key = value` line collected into one map."""
+    values = {}
+    for line in str(config_text or '').split('\n'):
+        line = line.strip()
+        if line.startswith('[') and line.endswith(']'):
+            continue
+        sep = line.find('=')
+        if sep > 0:
+            values[line[:sep].strip()] = line[sep + 1:].strip()
+    return values
+
+
+def build_amnezia_config(config_text, description):
+    """Wrap a WireGuard/AmneziaWG config into Amnezia's own server config format.
+
+    A plain `.conf` cannot carry a name: extractWireGuardConfig() overwrites
+    description with nextAvailableServerName(), which is why every imported key
+    lands as "Server 1". This JSON goes down the ConfigTypes::Amnezia branch
+    instead, which keeps whatever description it is given. Field for field it is
+    what the client itself builds from the same config.
+    """
+    values = parse_wg_config(config_text)
+    host, _, port = values.get('Endpoint', '').rpartition(':')
+    host = host.strip('[]')
+    if not host or not port.isdigit():
+        return None
+    if not (values.get('PrivateKey') and values.get('Address') and values.get('PublicKey')):
+        return None
+
+    last_config = {
+        'config': str(config_text),
+        'hostName': host,
+        'port': int(port),
+        'client_priv_key': values['PrivateKey'],
+        'client_ip': values['Address'],
+        'server_pub_key': values['PublicKey'],
+    }
+    psk = values.get('PresharedKey') or values.get('PreSharedKey')
+    if psk:
+        last_config['psk_key'] = psk
+    if values.get('PersistentKeepalive'):
+        last_config['persistent_keep_alive'] = values['PersistentKeepalive']
+    last_config['allowed_ips'] = [
+        part.strip() for part in values.get('AllowedIPs', '').split(',') if part.strip()
+    ]
+
+    protocol_name = 'wireguard'
+    for key in AWG_CONFIG_KEYS:
+        if values.get(key):
+            last_config[key] = values[key]
+            protocol_name = 'awg'
+    # processAmneziaConfig() replaces this with the client's own default on
+    # import, so a custom MTU only survives in the raw config below.
+    last_config['mtu'] = values.get('MTU') or ('1376' if protocol_name == 'awg' else '1420')
+
+    container = 'amnezia-awg' if protocol_name == 'awg' else 'amnezia-wireguard'
+    config = {
+        'containers': [{
+            'container': container,
+            protocol_name: {
+                'last_config': json.dumps(last_config, indent=4) + '\n',
+                'isThirdPartyConfig': True,
+                'port': str(port),
+                'transport_proto': 'udp',
+            },
+        }],
+        'defaultContainer': container,
+        'description': description,
+        'hostName': host,
+    }
+    dns = [part.strip() for part in values.get('DNS', '').split(',') if part.strip()]
+    if len(dns) >= 2:
+        config['dns1'], config['dns2'] = dns[0], dns[1]
+    return config
+
+
+def amnezia_vpn_key(config_text, description):
+    """base64url(qCompress(json)) -- the payload half of an Amnezia `vpn://` key.
+
+    qCompress prepends the uncompressed size as a big-endian uint32 and
+    qUncompress refuses anything without it. Empty when the config is not a
+    WireGuard/AmneziaWG one, so callers fall back to the plain key.
+    """
+    if not description:
+        return ''
+    config = build_amnezia_config(config_text, description)
+    if not config:
+        return ''
+    raw = json.dumps(config, indent=4).encode('utf-8')
+    compressed = struct.pack('>I', len(raw)) + zlib.compress(raw, 8)
+    return base64.urlsafe_b64encode(compressed).decode('utf-8').rstrip('=')
+
+
+def generate_vpn_link(config_text, server=None, protocol=None):
     """Encode a config as a vpn:// key.
 
     Amnezia decodes with QByteArray::Base64UrlEncoding|OmitTrailingEquals,
@@ -1063,8 +1200,31 @@ def generate_vpn_link(config_text):
     emits '+' or '/' -- which a config containing '>' or '?' does, the
     default I1 packet among them.
     """
+    key = amnezia_vpn_key(config_text, connection_display_name(server, protocol))
+    if key:
+        return f"vpn://{key}"
     b64 = base64.urlsafe_b64encode(config_text.strip().encode('utf-8')).decode('utf-8')
     return f"vpn://{b64.rstrip('=')}"
+
+
+def config_payloads(config_text, server=None, protocol=None):
+    """The three things every config view needs: key, QR payload, server name.
+
+    `vpn_qr` deliberately carries no `vpn://` prefix -- extractConfigFromQr()
+    hands the scanned text straight to QByteArray::fromBase64, which drops ':'
+    and '/' but keeps 'v', 'p' and 'n', shifting the whole payload by three
+    characters. Empty when the config is not a WireGuard/AmneziaWG one; the QR
+    then stays on the raw config, which is all such clients understand anyway.
+    """
+    name = connection_display_name(server, protocol)
+    if not str(config_text or '').strip():
+        return {'vpn_link': '', 'vpn_qr': '', 'vpn_name': name}
+    key = amnezia_vpn_key(config_text, name)
+    return {
+        'vpn_link': f"vpn://{key}" if key else generate_vpn_link(config_text),
+        'vpn_qr': key,
+        'vpn_name': name,
+    }
 
 
 # ===================== API tokens =====================
@@ -3295,7 +3455,7 @@ async def api_add_connection(request: Request, server_id: int, req: AddConnectio
         ssh.disconnect()
 
         if result.get('config'):
-            result['vpn_link'] = generate_vpn_link(result['config'])
+            result.update(config_payloads(result['config'], server, req.protocol))
 
         # Link connection to user if specified
         if req.user_id and result.get('client_id'):
@@ -3431,7 +3591,7 @@ async def api_save_connection_config(request: Request, server_id: int, req: Save
         manager = get_protocol_manager(ssh, req.protocol)
         _manager_call(manager, 'save_client_config', req.protocol, req.client_id, config_text)
         ssh.disconnect()
-        return {'status': 'success', 'vpn_link': generate_vpn_link(config_text)}
+        return {'status': 'success', **config_payloads(config_text, server, req.protocol)}
     except Exception as e:
         logger.exception("Error saving connection config")
         return JSONResponse({'error': str(e)}, status_code=500)
@@ -3464,8 +3624,7 @@ async def api_get_connection_config(request: Request, server_id: int, req: Conne
         manager = get_protocol_manager(ssh, req.protocol)
         config = _manager_call(manager, 'get_client_config', req.protocol, req.client_id, server['host'], port)
         ssh.disconnect()
-        vpn_link = generate_vpn_link(config) if config else ''
-        return {'config': config, 'vpn_link': vpn_link}
+        return {'config': config, **config_payloads(config, server, req.protocol)}
     except Exception as e:
         logger.exception("Error getting connection config")
         return JSONResponse({'error': str(e)}, status_code=500)
@@ -3630,7 +3789,7 @@ async def api_add_user(request: Request, req: AddUserRequest):
                     result['connection_created'] = True
                     if conn_result.get('config'):
                         result['config'] = conn_result['config']
-                        result['vpn_link'] = generate_vpn_link(conn_result['config'])
+                        result.update(config_payloads(conn_result['config'], server, req.protocol))
         return result
     except Exception as e:
         logger.exception("Error adding user")
@@ -3797,7 +3956,7 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
         resp = {'status': 'success'}
         if result.get('config'):
             resp['config'] = result['config']
-            resp['vpn_link'] = generate_vpn_link(result['config'])
+            resp.update(config_payloads(result['config'], server, req.protocol))
         return resp
     except Exception as e:
         logger.exception("Error adding user connection")
@@ -3940,8 +4099,7 @@ async def api_share_config(token: str, connection_id: str, request: Request):
         manager = get_protocol_manager(ssh, conn['protocol'])
         config = _manager_call(manager, 'get_client_config', conn['protocol'], conn['client_id'], server['host'], port)
         ssh.disconnect()
-        vpn_link = generate_vpn_link(config) if config else ''
-        return {'config': config, 'vpn_link': vpn_link}
+        return {'config': config, **config_payloads(config, server, conn['protocol'])}
     except Exception as e:
         logger.exception("Error getting shared config")
         return JSONResponse({'error': str(e)}, status_code=500)
@@ -3972,8 +4130,7 @@ async def api_my_connection_config(request: Request, connection_id: str):
         manager = get_protocol_manager(ssh, conn['protocol'])
         config = _manager_call(manager, 'get_client_config', conn['protocol'], conn['client_id'], server['host'], port)
         ssh.disconnect()
-        vpn_link = generate_vpn_link(config) if config else ''
-        return {'config': config, 'vpn_link': vpn_link}
+        return {'config': config, **config_payloads(config, server, conn['protocol'])}
     except Exception as e:
         logger.exception("Error getting my connection config")
         return JSONResponse({'error': str(e)}, status_code=500)

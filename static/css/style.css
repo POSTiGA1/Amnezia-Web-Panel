@@ -1651,6 +1651,37 @@ a:hover {
     text-align: center;
 }
 
+.qr-format {
+    display: flex;
+    gap: 2px;
+    background: var(--bg-secondary);
+    border-radius: var(--radius-sm);
+    padding: 3px;
+}
+
+.qr-format-btn {
+    padding: 6px 14px;
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    font-family: var(--font-family);
+    font-size: 0.78rem;
+    font-weight: 500;
+    cursor: pointer;
+    border-radius: 6px;
+    transition: all var(--transition-fast);
+}
+
+.qr-format-btn:hover {
+    color: var(--text-secondary);
+}
+
+.qr-format-btn.active {
+    background: var(--bg-card);
+    color: var(--text-primary);
+    box-shadow: var(--shadow-sm);
+}
+
 /* ===== VPN Link ===== */
 .vpn-link-box {
     background: var(--bg-primary);

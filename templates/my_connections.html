@@ -90,8 +90,15 @@
 
         <div class="config-panel" id="panel-qr">
             <div class="qr-container">
+                <div class="qr-format hidden" id="qrFormat">
+                    <button type="button" class="qr-format-btn active" data-fmt="amnezia"
+                        onclick="setQrFormat('amnezia')">{{ _('qr_format_amnezia') }}</button>
+                    <button type="button" class="qr-format-btn" data-fmt="wireguard"
+                        onclick="setQrFormat('wireguard')">{{ _('qr_format_wireguard') }}</button>
+                </div>
                 <div id="qrCode"></div>
                 <div class="qr-hint">{{ _('qr_hint') }}</div>
+                <div class="qr-hint" id="qrFormatHint"></div>
             </div>
         </div>
     </div>
@@ -128,7 +135,7 @@
 
                 switchConfigTab('conf');
                 openModal('configModal');
-                generateQR(result.config);
+                generateQR(result.config, result.vpn_qr);
             }
         } catch (err) {
             showToast(`${_('error')}: ` + err.message, 'error');
@@ -145,12 +152,42 @@
         document.getElementById(panels[tab]).classList.add('active');
     }
 
-    function generateQR(text) {
+    // The QR carries one of two payloads: Amnezia's own config format, which is
+    // the only one that can name the server, or the raw config, which is all
+    // AmneziaWG and wg-quick understand.
+    let currentQrConfig = '';
+    let currentQrPayload = '';
+    let currentQrFormat = 'amnezia';
+
+    function setQrFormat(format) {
+        currentQrFormat = format;
+        renderQR();
+    }
+
+    function generateQR(text, amneziaPayload) {
+        currentQrConfig = text || '';
+        currentQrPayload = amneziaPayload || '';
+        renderQR();
+    }
+
+    function renderQR() {
+        const named = currentQrFormat === 'amnezia' && !!currentQrPayload;
+        const switcher = document.getElementById('qrFormat');
+        if (switcher) {
+            switcher.classList.toggle('hidden', !currentQrPayload);
+            switcher.querySelectorAll('.qr-format-btn').forEach(b =>
+                b.classList.toggle('active', b.dataset.fmt === (named ? 'amnezia' : 'wireguard')));
+        }
+        const hint = document.getElementById('qrFormatHint');
+        if (hint) hint.textContent = _(named ? 'qr_format_amnezia_hint' : 'qr_format_wireguard_hint');
         const container = document.getElementById('qrCode');
         container.innerHTML = '';
+        // The named payload is roughly half again as long, so give it more room.
+        const size = named ? 320 : 280;
         try {
             new QRCode(container, {
-                text: text, width: 280, height: 280,
+                text: named ? currentQrPayload : currentQrConfig,
+                width: size, height: size,
                 colorDark: '#000000', colorLight: '#ffffff',
                 correctLevel: QRCode.CorrectLevel.L
             });
