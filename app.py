@@ -212,6 +212,7 @@ def get_ssh(server):
                 private_key=server.get('private_key'),
             )
             _SSH_POOL[key] = ssh
+        ssh.pooled = True
     ssh.ensure_connected()
     return ssh
 
@@ -223,7 +224,7 @@ def drop_ssh(server):
         ssh = _SSH_POOL.pop(key, None)
     if ssh is not None:
         try:
-            ssh.disconnect()
+            ssh.force_disconnect()
         except Exception:
             pass
 
