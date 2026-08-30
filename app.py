@@ -16,6 +16,7 @@ import subprocess
 import tarfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 import zipfile
 import signal
@@ -1110,6 +1111,139 @@ def parse_wg_config(config_text):
     return values
 
 
+# amnezia-awg only knows one link shape from this panel, and only that shape
+# can carry a name in its fragment.
+NAMED_LINK_SCHEMES = ('vless://',)
+
+# serialization::inbounds::GenerateInboundEntry(): the local SOCKS listener the
+# client patches with a free port and credentials when it connects.
+XRAY_INBOUND = {
+    'listen': '127.0.0.1',
+    'port': 10808,
+    'protocol': 'socks',
+    'settings': {'udp': True},
+}
+
+
+def apply_link_name(config_text, name):
+    """Put the connection's display name in a vless link's fragment.
+
+    AmneziaVPN reads that fragment as the server name (vless::Deserialize hands
+    it to extractXrayConfig as the description), so the panel's per-connection
+    label used to end up as the server's name in the client.
+    """
+    text = str(config_text or '').strip()
+    if not name or not text.startswith(NAMED_LINK_SCHEMES):
+        return config_text
+    return f"{text.split('#', 1)[0]}#{urllib.parse.quote(name)}"
+
+
+def build_xray_client_config(link):
+    """Turn a vless link into the xray client config the desktop client builds.
+
+    A port of serialization::vless::Deserialize -- the client only reaches that
+    code path for a bare `vless://` string, so anything wrapped (a `vpn://` key,
+    a QR code) has to arrive already deserialised.
+    """
+    if not str(link or '').strip().startswith('vless://'):
+        return None
+    parts = urllib.parse.urlsplit(link.strip())
+    host = (parts.hostname or '').strip('[]')
+    uuid_value = urllib.parse.unquote(parts.netloc.rpartition('@')[0])
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    if not host or not port or not uuid_value:
+        return None
+
+    query = {}
+    for key, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=True):
+        query.setdefault(key, value)
+
+    user = {'id': uuid_value, 'encryption': query.get('encryption', 'none')}
+    stream = {}
+
+    network = query.get('type', 'tcp')
+    if network != 'tcp':
+        stream['network'] = network
+    if network == 'kcp':
+        if query.get('seed'):
+            stream.setdefault('kcpSettings', {})['seed'] = query['seed']
+        if query.get('headerType', 'none') != 'none':
+            stream.setdefault('kcpSettings', {}).setdefault('header', {})['type'] = query['headerType']
+    elif network == 'http':
+        if query.get('path', '/') != '/':
+            stream.setdefault('httpSettings', {})['path'] = query['path']
+        if 'host' in query:
+            stream.setdefault('httpSettings', {})['host'] = query['host'].split(',')
+    elif network == 'ws':
+        if query.get('path', '/') != '/':
+            stream.setdefault('wsSettings', {})['path'] = query['path']
+        if 'host' in query:
+            stream.setdefault('wsSettings', {}).setdefault('headers', {})['Host'] = query['host']
+    elif network == 'quic':
+        if 'quicSecurity' in query:
+            quic = stream.setdefault('quicSettings', {})
+            quic['security'] = query['quicSecurity']
+            if query['quicSecurity'] != 'none':
+                quic['key'] = query.get('key', '')
+            if query.get('headerType', 'none') != 'none':
+                quic.setdefault('header', {})['type'] = query['headerType']
+    elif network == 'grpc':
+        if 'serviceName' in query:
+            stream.setdefault('grpcSettings', {})['serviceName'] = query['serviceName']
+        if 'mode' in query:
+            stream.setdefault('grpcSettings', {})['multiMode'] = query['mode'] == 'multi'
+
+    security = query.get('security', 'none')
+    tls_key = 'xtlsSettings' if security == 'xtls' else ('tlsSettings' if security == 'tls' else 'realitySettings')
+    if security != 'none':
+        stream['security'] = security
+    if 'sni' in query:
+        stream.setdefault(tls_key, {})['serverName'] = query['sni']
+    if 'alpn' in query:
+        # xray does not speak h2 here, and the client drops it
+        alpn = [item for item in query['alpn'].split(',') if item and item != 'h2']
+        if alpn:
+            stream.setdefault(tls_key, {})['alpn'] = alpn
+    if security in ('xtls', 'reality'):
+        user['flow'] = query.get('flow', '')
+    if security == 'reality':
+        reality = stream.setdefault('realitySettings', {})
+        for param, field in (('fp', 'fingerprint'), ('pbk', 'publicKey'), ('sid', 'shortId')):
+            if param in query:
+                reality[field] = query[param]
+        # the client only reads the long spelling, the panel emits the short one
+        spider = query.get('spiderX') or query.get('spx')
+        if spider:
+            reality['spiderX'] = spider
+
+    outbound = {
+        'protocol': 'vless',
+        'settings': {'vnext': [{'address': host, 'port': port, 'users': [user]}]},
+        'streamSettings': stream,
+    }
+    return {'inbounds': [dict(XRAY_INBOUND)], 'outbounds': [outbound]}
+
+
+def build_amnezia_xray_config(config_text, description):
+    """Wrap a vless link the way ImportController::extractXrayConfig would."""
+    client_config = build_xray_client_config(config_text)
+    if not client_config:
+        return None
+    serialized = json.dumps(client_config, indent=4, sort_keys=True) + '\n'
+    return {
+        'containers': [{
+            'container': 'amnezia-xray',
+            'xray': {'last_config': serialized, 'isThirdPartyConfig': True},
+        }],
+        'defaultContainer': 'amnezia-xray',
+        'description': description,
+        'hostName': client_config['outbounds'][0]['settings']['vnext'][0]['address'],
+    }
+
+
 def build_amnezia_config(config_text, description):
     """Wrap a WireGuard/AmneziaWG config into Amnezia's own server config format.
 
@@ -1119,6 +1253,8 @@ def build_amnezia_config(config_text, description):
     instead, which keeps whatever description it is given. Field for field it is
     what the client itself builds from the same config.
     """
+    if str(config_text or '').strip().startswith(NAMED_LINK_SCHEMES):
+        return build_amnezia_xray_config(config_text, description)
     values = parse_wg_config(config_text)
     host, _, port = values.get('Endpoint', '').rpartition(':')
     host = host.strip('[]')
@@ -1251,7 +1387,7 @@ def generate_vpn_link(config_text, server=None, protocol=None):
 
 
 def config_payloads(config_text, server=None, protocol=None):
-    """The three things every config view needs: key, QR frames, server name.
+    """What every config view needs: the config, the key, the QR frames, the name.
 
     The frames carry no `vpn://` prefix -- extractConfigFromQr() hands the
     scanned text straight to QByteArray::fromBase64, which drops ':' and '/'
@@ -1261,9 +1397,11 @@ def config_payloads(config_text, server=None, protocol=None):
     """
     name = connection_display_name(server, protocol)
     if not str(config_text or '').strip():
-        return {'vpn_link': '', 'vpn_qr_chunks': [], 'vpn_name': name}
+        return {'config': config_text, 'vpn_link': '', 'vpn_qr_chunks': [], 'vpn_name': name}
+    config_text = apply_link_name(config_text, name)
     key = amnezia_vpn_key(config_text, name)
     return {
+        'config': config_text,
         'vpn_link': f"vpn://{key}" if key else generate_vpn_link(config_text),
         'vpn_qr_chunks': amnezia_qr_chunks(config_text, name),
         'vpn_name': name,
