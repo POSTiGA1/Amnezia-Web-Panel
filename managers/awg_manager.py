@@ -1223,10 +1223,15 @@ tail -f /dev/null
             return {}
 
         container = self._container_name(protocol_type)
-        awk_prog = ("awk '{for(i=1;i<=NF;i++) if($i~/^src=/){sub(/^src=/,\"\",$i); "
-                    "print $i; break}}' /proc/net/nf_conntrack 2>/dev/null | sort | uniq -c")
+        # tr/grep/cut pipeline instead of awk: the command travels through a
+        # double remote shell (ssh + sh -c "..."), which mangles awk's $i
+        # fields no matter how they are escaped. Each conntrack line has two
+        # src= tokens (peer + external); the subnet filter below keeps only
+        # peer IPs, so counts match the awk version.
+        count_cmd = ("tr ' ' '\\n' < /proc/net/nf_conntrack 2>/dev/null "
+                     "| grep '^src=' | cut -d= -f2 | sort | uniq -c")
         out, err, code = self.ssh.run_sudo_command(
-            f'docker exec -i {container} sh -c "{awk_prog}"'
+            f'docker exec -i {container} sh -c "{count_cmd}"'
         )
         if code != 0 or not out.strip():
             return {}
