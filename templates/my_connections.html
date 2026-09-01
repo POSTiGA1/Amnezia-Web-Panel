@@ -509,5 +509,10 @@
             }, QR_FRAME_MS);
         }
     }
+
+    document.addEventListener('DOMContentLoaded', () => {
+        loadSelfServiceOptions();
+        loadConnections();
+    });
 </script>
 {% endblock %}
