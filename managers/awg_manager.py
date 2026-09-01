@@ -13,8 +13,10 @@ import os
 import secrets
 import struct
 import hashlib
+import ipaddress
 import logging
 import re
+import time
 from base64 import b64encode, b64decode
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from cryptography.hazmat.primitives import serialization
@@ -30,8 +32,7 @@ AWG_DEFAULTS = {
     'subnet_ip': '10.8.1.1',
     # IPv6 ULA subnet used for dual-stack tunnels (NAT66, no provider prefix needed)
     'subnet_ipv6_ip': 'fd42:8:1::1',
-    'subnet_ipv6_cidr': '64',
-    'dns1': '1.1.1.1',
+    'subnet_ipv6_cidr': '64',    'dns1': '1.1.1.1',
     'dns2': '1.0.0.1',
     # AWG obfuscation parameters
     'junk_packet_count': '3',
@@ -71,6 +72,11 @@ AWG3_CONFIG_KEYS = tuple(config_key for _, config_key in AWG3_PARAM_MAP)
 # checks in netlink.c. Below that `awg setconf` fails with a bare
 # "Invalid argument": the explanation only goes to net_dbg_ratelimited.
 AWG3_MIN_JUNK_SIZE = 12
+
+# Connection flood monitoring (P2P/torrent detection)
+CONN_WARN_THRESHOLD = 600    # simultaneous connections per peer that trigger a warning
+CONN_WARN_COOLDOWN = 3600    # min seconds between two recorded warnings for the same peer
+CONN_WARN_MAX_EVENTS = 5     # how many recent warnings are kept per peer
 
 
 def generate_wg_keypair():
@@ -132,6 +138,16 @@ def generate_awg_params(use_ranges=False, awg3=False):
             return result
         
         h1, h2, h3, h4 = make_ranges()
+    elif awg3:
+        # AWG 3.1: the official docs prescribe the compatibility values
+        # 1,2,3,4 when HeaderProtection is enabled - the custom-header
+        # mechanism is OFF then and Header Protection (ChaCha20 with the
+        # random per-server HeaderProtectionKey) hides the message type.
+        # This is exactly what the native AmneziaVPN client generates.
+        # Ranged H1-H4 with RandomTrailers=on are actively harmful:
+        # transport packets get misclassified as handshakes and die at
+        # CheckMAC1 (amneziawg-go#186, kernel-module#226).
+        h1, h2, h3, h4 = '1', '2', '3', '4'
     else:
         h1 = str(random.randint(100000000, 4294967295))
         h2 = str(random.randint(100000000, 4294967295))
@@ -461,15 +477,102 @@ fi
         return True
 
     def setup_firewall(self):
-        """Setup host firewall (mirrors setup_host_firewall.sh)."""
+        """Setup host firewall (mirrors setup_host_firewall.sh).
+
+        Also raises net.netfilter.nf_conntrack_max: the default on small
+        VMs can be as low as ~7680 entries, and every client flow through
+        the NAT consumes one entry. A full conntrack table makes the
+        kernel silently drop packets ("nf_conntrack: table full"), which
+        users see as random connection freezes. 262144 is a safe value
+        for a VPN gateway; persisted via /etc/sysctl.d.
+        """
         script = """
 sysctl -w net.ipv4.ip_forward=1
 sysctl -w net.ipv6.conf.all.forwarding=1 2>/dev/null || true
 iptables -C INPUT -p icmp --icmp-type echo-request -j DROP 2>/dev/null || iptables -A INPUT -p icmp --icmp-type echo-request -j DROP
 iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-USER 2>/dev/null
+if [ -f /proc/sys/net/netfilter/nf_conntrack_max ]; then
+    cur=$(cat /proc/sys/net/netfilter/nf_conntrack_max)
+    if [ "$cur" -lt 262144 ] 2>/dev/null; then
+        printf '%s\n' 'net.netfilter.nf_conntrack_max = 262144' > /etc/sysctl.d/98-awp-conntrack.conf
+        sysctl -w net.netfilter.nf_conntrack_max=262144
+    fi
+fi
 """
         self.ssh.run_sudo_script(script)
         return True
+
+    def setup_host_tuning(self):
+        """Enable BBR congestion control on the host (with persistence).
+
+        BBR is available in all kernels >= 4.9 (any modern Debian/Ubuntu).
+        If the tcp_bbr module is not loaded, load it and persist across
+        reboots. Falls back silently when the kernel has no BBR support.
+        BBR significantly outperforms cubic on lossy paths, which VPN
+        tunnels often traverse.
+        """
+        script = """
+set -e
+if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+    modprobe tcp_bbr 2>/dev/null || true
+fi
+if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+    echo tcp_bbr > /etc/modules-load.d/awp-bbr.conf
+    printf '%s\\n' \\
+        'net.core.default_qdisc = fq' \\
+        'net.ipv4.tcp_congestion_control = bbr' \\
+        > /etc/sysctl.d/99-awp-bbr.conf
+    sysctl -w net.core.default_qdisc=fq
+    sysctl -w net.ipv4.tcp_congestion_control=bbr
+fi
+"""
+        try:
+            self.ssh.run_sudo_script(script)
+        except Exception as err:
+            logger.warning(f"setup_host_tuning warning: {err}")
+        return True
+
+    def get_host_tuning(self):
+        """Read live network-tuning state for the whole server (host + all
+        AWG containers). Used by the server-level "Host tuning" modal.
+        """
+        script = """
+echo "HOST_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+echo "HOST_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null)"
+echo "HOST_CONNTRACK=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)"
+echo "HOST_CONNTRACK_COUNT=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)"
+echo "HOST_BACKLOG=$(sysctl -n net.core.netdev_max_backlog 2>/dev/null)"
+echo "HOST_SOMAXCONN=$(sysctl -n net.core.somaxconn 2>/dev/null)"
+for c in $(docker ps -a --format '{{.Names}}' | grep '^amnezia-awg' | sort); do
+  echo "CT_NAME=$c"
+  if docker ps --format '{{.Names}}' | grep -qx "$c"; then
+    echo "CT_RUNNING=1"
+    docker exec "$c" sh -c 'for p in net.core.rmem_max net.core.wmem_max net.ipv4.tcp_fastopen net.ipv4.tcp_mtu_probing; do echo "CTK_$p=$(sysctl -n $p 2>/dev/null)"; done; echo "CTK_nofile=$(ulimit -n)"' 2>/dev/null
+  else
+    echo "CT_RUNNING=0"
+  fi
+done
+"""
+        out, err, code = self.ssh.run_sudo_command(script, timeout=60)
+        info = {'host': {}, 'containers': []}
+        if code != 0 or not out:
+            return info
+        current = None
+        for line in out.splitlines():
+            if '=' not in line:
+                continue
+            key, _, val = line.partition('=')
+            key, val = key.strip(), val.strip()
+            if key.startswith('HOST_'):
+                info['host'][key[5:].lower()] = val
+            elif key == 'CT_NAME':
+                current = {'name': val, 'running': False, 'ct': {}}
+                info['containers'].append(current)
+            elif key == 'CT_RUNNING' and current is not None:
+                current['running'] = val == '1'
+            elif key.startswith('CTK_') and current is not None:
+                current['ct'][key[4:]] = val
+        return info
 
     def install_protocol(self, protocol_type, port=None, awg_params=None):
         """
@@ -483,7 +586,11 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
         if awg_params is None:
             base_proto = self._base_protocol(protocol_type)
             awg_params = generate_awg_params(
-                use_ranges=(base_proto in (self.AWG, self.AWG2, self.AWG3)),
+                # AWG 2.0: ranged H1-H4 ("min-max"). AWG 3.1: fixed 1,2,3,4
+                # per the official docs (custom headers off, Header
+                # Protection hides the message type) - same as the native
+                # AmneziaVPN client generates.
+                use_ranges=(base_proto in (self.AWG, self.AWG2)),
                 awg3=(base_proto == self.AWG3),
             )
 
@@ -530,8 +637,32 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
             f"\n"
             f"RUN mkdir -p /opt/amnezia\n"
             f'RUN echo "#!/bin/bash" > /opt/amnezia/start.sh && '
+            f'echo "sysctl -p /etc/sysctl.conf 2>/dev/null || true" >> /opt/amnezia/start.sh && '
             f'echo "tail -f /dev/null" >> /opt/amnezia/start.sh\n'
             f"RUN chmod a+x /opt/amnezia/start.sh\n"
+            f"\n"
+            f"# Network tuning (mirrors AmneziaVPN container tuning)\n"
+            f"RUN printf '%s\\n' \\\n"
+            f"'fs.file-max = 51200' \\\n"
+            f"'net.core.rmem_max = 67108864' \\\n"
+            f"'net.core.wmem_max = 67108864' \\\n"
+            f"'net.core.netdev_max_backlog = 250000' \\\n"
+            f"'net.core.somaxconn = 4096' \\\n"
+            f"'net.ipv4.tcp_syncookies = 1' \\\n"
+            f"'net.ipv4.tcp_tw_reuse = 1' \\\n"
+            f"'net.ipv4.tcp_fin_timeout = 30' \\\n"
+            f"'net.ipv4.tcp_keepalive_time = 1200' \\\n"
+            f"'net.ipv4.ip_local_port_range = 10000 65000' \\\n"
+            f"'net.ipv4.tcp_max_syn_backlog = 8192' \\\n"
+            f"'net.ipv4.tcp_max_tw_buckets = 5000' \\\n"
+            f"'net.ipv4.tcp_fastopen = 3' \\\n"
+            f"'net.ipv4.tcp_mem = 25600 51200 102400' \\\n"
+            f"'net.ipv4.tcp_rmem = 4096 87380 67108864' \\\n"
+            f"'net.ipv4.tcp_wmem = 4096 65536 67108864' \\\n"
+            f"'net.ipv4.tcp_mtu_probing = 1' \\\n"
+            f" >> /etc/sysctl.conf && \\\n"
+            f"mkdir -p /etc/security && \\\n"
+            f"printf '%s\\n' '* soft nofile 51200' '* hard nofile 51200' >> /etc/security/limits.conf\n"
             f"\n"
             f'ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]\n'
         )
@@ -567,7 +698,9 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
 -p {port}:{port}/udp \
 -v /lib/modules:/lib/modules \
 --sysctl="net.ipv4.conf.all.src_valid_mark=1" \
-{ipv6_sysctls}--name {container_name} \
+{ipv6_sysctls} --name {container_name} \
+--ulimit nofile=51200:51200 \
+--name {container_name} \
 {container_name}"""
 
         out, err, code = self.ssh.run_sudo_command(run_cmd)
@@ -601,6 +734,11 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
         results.append("Setting up firewall...")
         self.setup_firewall()
         results.append("Firewall configured")
+
+        # Step 9: Host network tuning (BBR)
+        results.append("Applying host network tuning (BBR)...")
+        self.setup_host_tuning()
+        results.append("Host network tuning applied")
 
         return {
             'status': 'success',
@@ -740,6 +878,9 @@ EOF
 
         start_script = f"""#!/bin/bash
 echo "Container startup"
+
+# Apply container network tuning (see Dockerfile)
+sysctl -p /etc/sysctl.conf 2>/dev/null || true
 
 # Read subnet from server config dynamically (IPv4 part of the Address line)
 SUBNET=$(grep '^Address' {config_path} | head -1 | cut -d'=' -f2 | cut -d',' -f1 | tr -d ' ')
@@ -893,6 +1034,9 @@ tail -f /dev/null
         quick_bin = self._quick_binary(protocol_type)
         start_script = f"""#!/bin/bash
 echo "Container startup"
+
+# Apply container network tuning (see Dockerfile)
+sysctl -p /etc/sysctl.conf 2>/dev/null || true
 
 # Read subnet from server config dynamically (IPv4 part of the Address line)
 SUBNET=$(grep '^Address' {config_path} | head -1 | cut -d'=' -f2 | cut -d',' -f1 | tr -d ' ')
@@ -1191,6 +1335,31 @@ tail -f /dev/null
         except Exception as e:
             logger.warning(f'get_clients: failed to parse conf peers: {e}')
 
+        # Connection flood monitoring: attach the latest snapshot written by
+        # the background collector (collect_conn_stats). Only if the snapshot
+        # does not exist yet (fresh install / right after upgrade) fall back
+        # to a one-off live count so the UI is not empty for the first minute.
+        try:
+            conn_counts = self._load_conn_counts(protocol_type)
+            if not conn_counts:
+                conn_counts = self._count_connections_by_ip(protocol_type)
+            conn_warnings = self._load_conn_warnings(protocol_type)
+            for client in clients_table:
+                user_data = client.get('userData', {})
+                ip = user_data.get('clientIp', '')
+                if not ip:
+                    m = re.search(r'(\d+\.\d+\.\d+\.\d+)', user_data.get('allowedIps', '') or '')
+                    ip = m.group(1) if m else ''
+                if not ip:
+                    continue
+                user_data['clientIp'] = ip
+                user_data['connCount'] = conn_counts.get(ip, 0)
+                if ip in conn_warnings:
+                    user_data['connWarnings'] = conn_warnings[ip]
+                client['userData'] = user_data
+        except Exception as e:
+            logger.warning(f'get_clients: conn monitoring failed: {e}')
+
         return clients_table
 
     def _parse_bytes(self, size_str):
@@ -1203,6 +1372,168 @@ tail -f /dev/null
             return int(val * units.get(unit, 1))
         except Exception:
             return 0
+
+    # ---- Connection flood monitoring (P2P/torrent detection) ----
+
+    def _conn_warnings_path(self):
+        """Path inside container, next to clientsTable (persisted via volume)."""
+        return '/opt/amnezia/awg/conn_warnings.json'
+
+    def _count_connections_by_ip(self, protocol_type):
+        """Count conntrack entries per peer IP.
+
+        Aggregates /proc/net/nf_conntrack INSIDE the instance container
+        (NAT for the VPN subnet happens in the container's netns, so the
+        host table only shows the container's own IP) and transfers only
+        the compact "count ip" summary instead of the multi-megabyte raw
+        table.
+        Returns {ip: count}; empty dict if conntrack is unavailable.
+        """
+        try:
+            subnet_ip = self._get_subnet_ip(protocol_type)
+            cidr = int(self._get_subnet_cidr(protocol_type))
+            network = ipaddress.ip_network(f'{subnet_ip}/{cidr}', strict=False)
+        except Exception:
+            return {}
+
+        container = self._container_name(protocol_type)
+        # tr/grep/cut pipeline instead of awk: the command travels through a
+        # double remote shell (ssh + sh -c "..."), which mangles awk's $i
+        # fields no matter how they are escaped. Each conntrack line has two
+        # src= tokens (peer + external); the subnet filter below keeps only
+        # peer IPs, so counts match the awk version.
+        count_cmd = ("tr ' ' '\\n' < /proc/net/nf_conntrack 2>/dev/null "
+                     "| grep '^src=' | cut -d= -f2 | sort | uniq -c")
+        out, err, code = self.ssh.run_sudo_command(
+            f'docker exec -i {container} sh -c "{count_cmd}"'
+        )
+        if code != 0 or not out.strip():
+            return {}
+
+        counts = {}
+        for line in out.split('\n'):
+            parts = line.split()
+            if len(parts) != 2:
+                continue
+            cnt_s, ip = parts
+            try:
+                if ipaddress.ip_address(ip) in network:
+                    counts[ip] = int(cnt_s)
+            except ValueError:
+                continue
+        return counts
+
+    def _conn_counts_path(self):
+        """Path inside container with the latest per-IP connection counts."""
+        return '/opt/amnezia/awg/conn_counts.json'
+
+    def _load_conn_counts(self, protocol_type):
+        """Load latest {ip: count} snapshot written by the collector."""
+        container_name = self._container_name(protocol_type)
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker exec -i {container_name} cat {self._conn_counts_path()} 2>/dev/null"
+        )
+        if code != 0 or not out.strip():
+            return {}
+        try:
+            data = json.loads(out)
+            return {k: int(v) for k, v in data.items()} if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return {}
+
+    def _save_conn_counts(self, protocol_type, counts):
+        """Persist the {ip: count} snapshot into the container."""
+        container_name = self._container_name(protocol_type)
+        self.ssh.upload_file(json.dumps(counts), "/tmp/_amnz_conncount.json")
+        self.ssh.run_sudo_command(
+            f"docker cp /tmp/_amnz_conncount.json {container_name}:{self._conn_counts_path()}"
+        )
+        self.ssh.run_command("rm -f /tmp/_amnz_conncount.json")
+
+    def collect_conn_stats(self, protocol_type):
+        """Background collector: one cheap SSH roundtrip per instance.
+
+        Counts conntrack entries per peer IP inside the container (compact
+        awk summary, no raw table transfer), saves the snapshot and records
+        flood warnings. Called by the panel's background monitor so that
+        detection runs 24/7 even when nobody has the UI open.
+        """
+        counts = self._count_connections_by_ip(protocol_type)
+        if not counts:
+            return False
+        try:
+            self._save_conn_counts(protocol_type, counts)
+        except Exception as e:
+            logger.warning(f'failed to save conn counts: {e}')
+        self._update_conn_warnings(protocol_type, counts)
+        return True
+
+    def _load_conn_warnings(self, protocol_type):
+        """Load recorded warnings {ip: [{ts, count}, ...]} from the container."""
+        container_name = self._container_name(protocol_type)
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker exec -i {container_name} cat {self._conn_warnings_path()} 2>/dev/null"
+        )
+        if code != 0 or not out.strip():
+            return {}
+        try:
+            data = json.loads(out)
+            return data if isinstance(data, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+
+    def _save_conn_warnings(self, protocol_type, warnings):
+        """Persist warnings into the container (same pattern as clientsTable)."""
+        container_name = self._container_name(protocol_type)
+        self.ssh.upload_file(json.dumps(warnings), "/tmp/_amnz_connwarn.json")
+        self.ssh.run_sudo_command(
+            f"docker cp /tmp/_amnz_connwarn.json {container_name}:{self._conn_warnings_path()}"
+        )
+        self.ssh.run_command("rm -f /tmp/_amnz_connwarn.json")
+
+    def _update_conn_warnings(self, protocol_type, counts):
+        """Record a warning for every peer above CONN_WARN_THRESHOLD.
+
+        At most one warning per peer per CONN_WARN_COOLDOWN seconds; only the
+        last CONN_WARN_MAX_EVENTS are kept. Returns {ip: [{ts, count}, ...]}.
+        """
+        warnings = self._load_conn_warnings(protocol_type)
+        now = int(time.time())
+        changed = False
+        for ip, count in counts.items():
+            if count < CONN_WARN_THRESHOLD:
+                continue
+            events = warnings.get(ip, [])
+            if events and now - int(events[-1].get('ts', 0)) < CONN_WARN_COOLDOWN:
+                continue
+            events.append({'ts': now, 'count': count})
+            warnings[ip] = events[-CONN_WARN_MAX_EVENTS:]
+            changed = True
+        if changed:
+            try:
+                self._save_conn_warnings(protocol_type, warnings)
+            except Exception as e:
+                logger.warning(f'failed to save conn warnings: {e}')
+        return warnings
+
+    def clear_conn_warnings(self, protocol_type, client_id):
+        """Clear all recorded connection-flood warnings for one peer."""
+        clients_table = self._get_clients_table(protocol_type)
+        client = next((c for c in clients_table if c.get('clientId') == client_id), None)
+        ip = None
+        if client:
+            ud = client.get('userData', {}) or {}
+            ip = ud.get('clientIp')
+            if not ip:
+                m = re.search(r'(\d+\.\d+\.\d+\.\d+)', ud.get('allowedIps', '') or '')
+                ip = m.group(1) if m else None
+        if not ip:
+            raise RuntimeError('Client IP not found')
+        warnings = self._load_conn_warnings(protocol_type)
+        if ip in warnings:
+            warnings.pop(ip, None)
+            self._save_conn_warnings(protocol_type, warnings)
+        return {'status': 'success', 'cleared_ip': ip}
 
     def _wg_show(self, protocol_type):
         """Run 'wg show all' and parse output."""

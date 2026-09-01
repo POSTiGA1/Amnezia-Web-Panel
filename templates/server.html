@@ -151,6 +151,9 @@
                 <button class="btn btn-secondary btn-sm" onclick="openManagementModal()" id="managementBtn">
                     <span>⚙️</span> {{ _('management') }}
                 </button>
+                <button class="btn btn-secondary btn-sm" onclick="openHostTuning()" id="hostTuningBtn">
+                    <span>📊</span> {{ _('host_tuning') }}
+                </button>
             </div>
         </div>
     </div>
@@ -946,6 +949,16 @@
         </div>
     </div>
 </div>
+<!-- ===== Host Tuning Modal ===== -->
+<div class="modal-backdrop" id="hostTuningModal">
+    <div class="modal" style="max-width:520px;">
+        <div class="modal-header">
+            <h2 class="modal-title">📊 {{ _('host_tuning') }}</h2>
+            <button class="modal-close" onclick="closeModal('hostTuningModal')">×</button>
+        </div>
+        <div id="hostTuningBody" style="margin-top:var(--space-md); font-size:12px; line-height:1.6;"></div>
+    </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -1639,6 +1652,45 @@
         }
     }
 
+    // Host network tuning modal (server-level)
+    async function openHostTuning() {
+        try {
+            showToast(_('loading'), 'info');
+            const res = await apiCall(`/api/servers/${SERVER_ID}/host_tuning`, 'POST', {});
+            renderHostTuning(res);
+            openModal('hostTuningModal');
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        }
+    }
+
+    function renderHostTuning(t) {
+        const el = document.getElementById('hostTuningBody');
+        if (!el) return;
+        if (!t) { el.innerHTML = ''; return; }
+        const esc = s => String(s ?? '—').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+        const row = (k, v) => `<div style="display:flex;justify-content:space-between;gap:12px;"><span style="opacity:.7">${k}</span><code>${esc(v)}</code></div>`;
+        let html = '';
+        const h = t.host || {};
+        html += `<div style="opacity:.85;font-weight:600;margin-bottom:2px;">Host</div>`;
+        html += row('congestion control', h.cc);
+        html += row('qdisc', h.qdisc);
+        html += row('conntrack', `${h.conntrack_count || 0} / ${h.conntrack || '—'}`);
+        html += row('netdev_max_backlog', h.netdev_max_backlog);
+        html += row('somaxconn', h.somaxconn);
+        for (const c of (t.containers || [])) {
+            html += `<div style="font-weight:600;margin:12px 0 2px;">🐳 ${esc(c.name)} ${c.running ? '<span style="color:var(--success,#3fb950)">● online</span>' : '<span style="color:var(--danger,#f85149)">● stopped</span>'}</div>`;
+            if (c.running && c.ct) {
+                html += row('rmem_max / wmem_max', `${c.ct['net.core.rmem_max'] || '—'} / ${c.ct['net.core.wmem_max'] || '—'}`);
+                html += row('tcp_fastopen', c.ct['net.ipv4.tcp_fastopen']);
+                html += row('tcp_mtu_probing', c.ct['net.ipv4.tcp_mtu_probing']);
+                html += row('nofile (ulimit -n)', c.ct['nofile']);
+            }
+        }
+        if (!(t.containers || []).length) html += `<div style="opacity:.6;margin-top:8px;">No AWG containers</div>`;
+        el.innerHTML = html;
+    }
+
     // Save server config changes
     async function saveServerConfig() {
         const proto = document.getElementById('serverConfigProto').value;
@@ -2038,6 +2090,16 @@
             return;
         }
 
+        // Skip poll re-renders while the rename editor is open — a full innerHTML
+        // rebuild would destroy the input mid-typing
+        if (isPoll && document.querySelector('#connectionsListInner .rename-editor')) {
+            clearTimeout(window.connPollTimer);
+            if (document.getElementById('connectionsSection').style.display !== 'none') {
+                window.connPollTimer = setTimeout(function() { loadConnections(true); }, 5000);
+            }
+            return;
+        }
+
         if (window.connLoading) return; // don't stack overlapping polls
         window.connLoading = true;
         if (!isPoll) loading.style.display = ''; // silent refresh on polls
@@ -2066,9 +2128,29 @@
                 const assignedUser = client.assigned_user || '';
                 client._online = false; // reset each render; set by the handshake badge below
 
+                // Peer internal IP shown next to the name
+                const peerIp = userData.clientIp || (userData.allowedIps || '').match(/(\d+\.\d+\.\d+\.\d+)/)?.[1] || '';
+                const ipHtml = peerIp ? ` <span class="client-ip">${escapeHtml(peerIp)}</span>` : '';
+
                 let metaHtml = '';
                 if (assignedUser) metaHtml += `<span class="badge badge-info" style="font-size:0.65rem;">👤 ${escapeHtml(assignedUser)}</span>`;
                 if (created) metaHtml += `<span>📅 ${formatDate(created)}</span>`;
+
+                // Connection flood warnings (P2P/torrent detection), newest last
+                let warningsHtml = '';
+                if (Array.isArray(userData.connWarnings) && userData.connWarnings.length) {
+                    warningsHtml = '<div class="conn-warnings">' + userData.connWarnings.map(ev => {
+                        const d = new Date(ev.ts * 1000);
+                        const dateStr = String(d.getDate()).padStart(2, '0') + '.' + String(d.getMonth() + 1).padStart(2, '0') + '.' + d.getFullYear();
+                        const timeStr = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+                        const text = _('conn_warning_text')
+                            .replace('{date}', dateStr)
+                            .replace('{time}', timeStr)
+                            .replace('{count}', ev.count);
+                        return `<div class="conn-warning">${escapeHtml(text)}</div>`;
+                    }).join('') +
+                    `<button class="btn btn-secondary btn-sm btn-icon conn-warning-clear" onclick="clearConnWarnings('${escapeJs(client.clientId)}')" title="${_('clear_warnings')}" style="margin-top:4px;">🗑</button></div>`;
+                }
 
                 if (proto === 'telemt') {
                     if (userData.total_octets) metaHtml += `<span class="traffic-badge">📊 ${formatBytes(userData.total_octets)}</span>`;
@@ -2077,11 +2159,16 @@
                     if (userData.quota) metaHtml += `<span class="badge" style="font-size:0.65rem;">Quota: ${formatBytes(userData.quota)}</span>`;
                     if (userData.expiry) metaHtml += `<span class="badge" style="font-size:0.65rem;">⌛ ${formatDate(userData.expiry)}</span>`;
                 } else {
-                    if (handshake) metaHtml += `<span>🤝 ${handshake}</span>`;
+                    const hsSec = parseHandshakeAgo(handshake);
+                    const isOnline = hsSec !== null && hsSec < 180;
+                    if (handshake) metaHtml += `<span class="meta-handshake${isOnline ? ' meta-online' : ''}">🤝 ${formatHandshakeCompact(handshake)}</span>`;
                     // awg show reports transfer from the SERVER perspective:
                     // "received" = client upload, "sent" = client download.
                     if (sent) metaHtml += `<span class="traffic-badge traffic-down">↓ ${sent}</span>`;
                     if (received) metaHtml += `<span class="traffic-badge traffic-up">↑ ${received}</span>`;
+                    const rates = computeRates(client.clientId, userData);
+                    if (rates) metaHtml += `<span class="traffic-badge speed-badge${rates.active ? ' speed-active' : ''}">↓${formatBytes(Math.round(rates.rx))}/s ↑${formatBytes(Math.round(rates.tx))}/s</span>`;
+                    if (isOnline) client._online = true;
                 }
 
                 if (!enabled) metaHtml += `<span class="badge badge-danger" style="font-size:0.65rem">${_('stop')}</span>`;
@@ -2098,8 +2185,9 @@
                         <div class="client-info">
                             <div class="client-avatar${client._online ? ' avatar-online' : ''}">${initial}</div>
                             <div>
-                                <div class="client-name">${escapeHtml(name)}</div>
+                                <div class="client-name">${escapeHtml(name)}${ipHtml}</div>
                                 <div class="client-meta">${metaHtml || `<span class="text-muted">${_('no_data')}</span>`}</div>
+                                ${warningsHtml}
                             </div>
                         </div>
                         <div class="client-actions">
@@ -2239,10 +2327,27 @@
         }
     }
 
+    // Clear connection-flood (torrent) warnings history for a peer
+    async function clearConnWarnings(clientId) {
+        const proto = document.getElementById('connProtoSelect').value;
+        try {
+            await apiCall(`/api/servers/${SERVER_ID}/connections/clear_warnings`, 'POST', {
+                protocol: proto, client_id: clientId,
+            });
+            showToast(_('warnings_cleared'), 'success');
+            loadConnections();
+        } catch (err) {
+            showToast(_('error') + ': ' + err.message, 'error');
+        }
+    }
+
     function startRenameConnection(clientId, btn) {
         const item = btn.closest('.client-item');
         const nameEl = item.querySelector('.client-name');
-        const oldName = nameEl.textContent;
+        // .client-name also contains the .client-ip span; edit the name only
+        const clone = nameEl.cloneNode(true);
+        clone.querySelectorAll('.client-ip').forEach(el => el.remove());
+        const oldName = clone.textContent.trim();
         nameEl.innerHTML = `
             <span class="rename-editor" style="display:inline-flex;gap:4px;align-items:center;">
                 <input type="text" class="form-input" style="padding:2px 8px;font-size:0.85rem;width:160px;height:auto;" value="${escapeHtml(oldName)}">
