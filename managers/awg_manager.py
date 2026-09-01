@@ -80,6 +80,83 @@ AWG3_CONFIG_KEYS = tuple(config_key for _, config_key in AWG3_PARAM_MAP)
 # "Invalid argument": the explanation only goes to net_dbg_ratelimited.
 AWG3_MIN_JUNK_SIZE = 12
 
+# Special junk packets I1-I5: free-form packets the peer sends right before
+# the handshake initiation, so a session opens with bytes that belong to some
+# other protocol. The kernel module parses each value as a list of tags
+# (jp_parse_tags in junk.c):
+#   <b 0xHEX>  fixed bytes          <r N>   N random bytes
+#   <c>        packet counter, 4B   <rc N>  N random latin letters
+#   <t>        unix time, 4B        <rd N>  N random digits
+SPECIAL_JUNK_KEYS = ('i1', 'i2', 'i3', 'i4', 'i5')
+
+# Byte-identical to protocols::awg::defaultSpecialJunk1 in the desktop client:
+# a DNS response for icloud.com preceded by a random 2-byte transaction id.
+AWG_DEFAULT_I1 = (
+    '<r 2><b 0x858000010001000000000669636c6f756403636f6d'
+    '0000010001c00c000100010000105a00044d583737>'
+)
+
+_SPECIAL_JUNK_TAG_RE = re.compile(r'<\s*(b|c|t|r|rc|rd)(?:\s+([^>]*?))?\s*>')
+
+# A junk packet still has to fit into one datagram.
+SPECIAL_JUNK_MAX_SIZE = 1280
+
+
+def validate_special_junk(value):
+    """Validate an I1-I5 value and return the packet size it produces."""
+    text = (value or '').strip()
+    if not text:
+        return 0
+
+    size = 0
+    pos = 0
+    for match in _SPECIAL_JUNK_TAG_RE.finditer(text):
+        between = text[pos:match.start()].strip()
+        if between:
+            raise ValueError(f"unexpected text outside a tag: {between!r}")
+        pos = match.end()
+
+        tag = match.group(1)
+        arg = (match.group(2) or '').strip()
+        if tag in ('c', 't'):
+            if arg:
+                raise ValueError(f"<{tag}> takes no argument")
+            size += 4
+        elif tag == 'b':
+            digits = arg[2:] if arg[:2].lower() == '0x' else ''
+            if not digits or len(digits) % 2 or not all(c in '0123456789abcdefABCDEF' for c in digits):
+                raise ValueError("<b> expects an even number of hex digits, e.g. <b 0xdeadbeef>")
+            size += len(digits) // 2
+        else:
+            if not arg.isdigit() or int(arg) <= 0:
+                raise ValueError(f"<{tag}> expects a positive byte count, e.g. <{tag} 16>")
+            size += int(arg)
+
+    trailing = text[pos:].strip()
+    if trailing:
+        raise ValueError(f"unexpected text outside a tag: {trailing!r}")
+    if size == 0:
+        raise ValueError("no packet tags found, nothing would be sent")
+    if size > SPECIAL_JUNK_MAX_SIZE:
+        raise ValueError(f"packet is {size} bytes, maximum is {SPECIAL_JUNK_MAX_SIZE}")
+    return size
+
+
+def normalize_special_junk(values):
+    """Validate an {'i1': ..., 'i5': ...} mapping and drop empty entries."""
+    result = {}
+    for key in SPECIAL_JUNK_KEYS:
+        value = (values or {}).get(key)
+        value = (value or '').strip()
+        if not value:
+            continue
+        try:
+            validate_special_junk(value)
+        except ValueError as exc:
+            raise ValueError(f"{key.upper()}: {exc}") from exc
+        result[key] = value
+    return result
+
 # Connection flood monitoring (P2P/torrent detection)
 CONN_WARN_THRESHOLD = 600    # simultaneous connections per peer that trigger a warning
 CONN_WARN_COOLDOWN = 3600    # min seconds between two recorded warnings for the same peer
@@ -625,7 +702,8 @@ done
                 current['ct'][key[4:]] = val
         return info
 
-    def install_protocol(self, protocol_type, port=None, awg_params=None):
+    def install_protocol(self, protocol_type, port=None, awg_params=None,
+                         mtu=None, dns=None, special_junk=None):
         """
         Full installation of AWG or AWG-Legacy protocol.
         Steps: install docker -> prepare host -> build container ->
