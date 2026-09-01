@@ -213,14 +213,41 @@ async def save_data_async(data):
         await asyncio.to_thread(save_data, data)
 
 
+# Long-lived SSH connections, keyed by (host, port, username). Each command
+# becomes a cheap channel on an existing transport instead of a full TCP+SSH
+# handshake per API call — the main fix for UI timeouts on distant servers.
+_SSH_POOL = {}
+_SSH_POOL_LOCK = threading.Lock()
+
+
 def get_ssh(server):
-    return SSHManager(
-        host=server['host'],
-        port=server.get('ssh_port', 22),
-        username=server['username'],
-        password=server.get('password'),
-        private_key=server.get('private_key'),
-    )
+    key = (server['host'], int(server.get('ssh_port', 22)), server['username'])
+    with _SSH_POOL_LOCK:
+        ssh = _SSH_POOL.get(key)
+        if ssh is None:
+            ssh = SSHManager(
+                host=server['host'],
+                port=server.get('ssh_port', 22),
+                username=server['username'],
+                password=server.get('password'),
+                private_key=server.get('private_key'),
+            )
+            _SSH_POOL[key] = ssh
+        ssh.pooled = True
+    ssh.ensure_connected()
+    return ssh
+
+
+def drop_ssh(server):
+    """Remove a server's pooled connection (on edit/delete) and close it."""
+    key = (server['host'], int(server.get('ssh_port', 22)), server['username'])
+    with _SSH_POOL_LOCK:
+        ssh = _SSH_POOL.pop(key, None)
+    if ssh is not None:
+        try:
+            ssh.force_disconnect()
+        except Exception:
+            pass
 
 
 def get_panel_local_url(request: Optional[Request] = None):
@@ -2700,6 +2727,8 @@ async def api_edit_server(request: Request, server_id: int, req: EditServerReque
         server['private_key'] = new_key
         server['server_info'] = server_info
         save_data(data)
+        # Drop the stale pooled connection: credentials/host may have changed.
+        drop_ssh(server)
         return {'status': 'success', 'server_info': server_info}
     except Exception as e:
         logger.exception("Error editing server")
@@ -2781,6 +2810,8 @@ async def api_delete_server(request: Request, server_id: int):
         data = load_data()
         if server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        drop_ssh(server)
         data['servers'].pop(server_id)
         # Clean up connections for this server
         data['user_connections'] = [c for c in data.get('user_connections', []) if c.get('server_id') != server_id]
