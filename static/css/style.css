@@ -1474,6 +1474,10 @@ a:hover {
     color: var(--danger);
 }
 
+.log-line.warning {
+    color: var(--warning);
+}
+
 .log-line.info {
     color: var(--text-secondary);
 }

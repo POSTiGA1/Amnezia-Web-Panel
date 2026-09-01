@@ -2113,7 +2113,11 @@
             fillEl.style.width = '100%';
             if (result.log) {
                 result.log.forEach(line => {
-                    logEl.innerHTML += `<div class="log-line success">✓ ${line}</div>`;
+                    // Installers mark a line that succeeded with a caveat by
+                    // prefixing it with "!" - a green tick would hide it.
+                    logEl.innerHTML += line.startsWith('!')
+                        ? `<div class="log-line warning">⚠ ${line.slice(1).trim()}</div>`
+                        : `<div class="log-line success">✓ ${line}</div>`;
                 });
             }
             logEl.scrollTop = logEl.scrollHeight;
