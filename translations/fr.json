@@ -423,5 +423,7 @@
   "host_tuning": "Réglages hôte",
   "conn_warning_text": "⚠️ Attention : {count} connexions ouvertes le {date} à {time} !",
   "clear_warnings": "Effacer les avertissements",
-  "warnings_cleared": "Avertissements effacés"
+  "warnings_cleared": "Avertissements effacés",
+  "max_speed": "Vitesse max (Mbps)",
+  "speed_limit_unlim": "Limite de vitesse (0 = illimité)"
 }

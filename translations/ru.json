@@ -456,5 +456,7 @@
   "host_tuning": "Конфигурация",
   "conn_warning_text": "⚠️ Внимание: {date} в {time} открыто {count} соединений!",
   "clear_warnings": "Очистить предупреждения",
-  "warnings_cleared": "Предупреждения очищены"
+  "warnings_cleared": "Предупреждения очищены",
+  "max_speed": "Макс. скорость (Мбит/с)",
+  "speed_limit_unlim": "Лимит скорости (0 = без лимита)"
 }

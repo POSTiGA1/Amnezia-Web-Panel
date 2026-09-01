@@ -456,5 +456,7 @@
   "host_tuning": "Host tuning",
   "conn_warning_text": "⚠️ Warning: {count} connections opened at {time} on {date}!",
   "clear_warnings": "Clear warnings",
-  "warnings_cleared": "Warnings cleared"
+  "warnings_cleared": "Warnings cleared",
+  "max_speed": "Max speed (Mbps)",
+  "speed_limit_unlim": "Speed limit (0 = unlim.)"
 }
