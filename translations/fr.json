@@ -105,6 +105,8 @@
   "connection_name_placeholder": "Ex: iPhone, Laptop",
   "assign_to_user": "Assigner à l'utilisateur (optionnel)",
   "no_assign": "— Aucune assignation —",
+  "select_search_placeholder": "Rechercher...",
+  "select_search_empty": "Aucun résultat",
   "create": "Créer",
   "creating": "Création...",
   "connection_created": "Connexion \"{}\" créée",
@@ -417,5 +419,9 @@
   "reset_traffic": "Réinitialiser le trafic",
   "resetting": "Réinitialisation...",
   "reset_traffic_confirm": "Réinitialiser le trafic actuel de cet utilisateur ? Les statistiques totales seront conservées.",
-  "traffic_reset_success": "Trafic réinitialisé"
+  "traffic_reset_success": "Trafic réinitialisé",
+  "host_tuning": "Réglages hôte",
+  "conn_warning_text": "⚠️ Attention : {count} connexions ouvertes le {date} à {time} !",
+  "clear_warnings": "Effacer les avertissements",
+  "warnings_cleared": "Avertissements effacés"
 }

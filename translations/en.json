@@ -106,6 +106,8 @@
   "connection_name_placeholder": "Example: iPhone, Laptop",
   "assign_to_user": "Assign to user (optional)",
   "no_assign": "— No assignment —",
+  "select_search_placeholder": "Search...",
+  "select_search_empty": "No matches",
   "create": "Create",
   "creating": "Creating...",
   "connection_created": "Connection \"{}\" created",
@@ -450,5 +452,9 @@
   "reset_traffic": "Reset traffic",
   "resetting": "Resetting...",
   "reset_traffic_confirm": "Reset this user's current traffic? Total statistics will be kept.",
-  "traffic_reset_success": "Traffic reset"
+  "traffic_reset_success": "Traffic reset",
+  "host_tuning": "Host tuning",
+  "conn_warning_text": "⚠️ Warning: {count} connections opened at {time} on {date}!",
+  "clear_warnings": "Clear warnings",
+  "warnings_cleared": "Warnings cleared"
 }

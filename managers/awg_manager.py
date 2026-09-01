@@ -13,13 +13,22 @@ import os
 import secrets
 import struct
 import hashlib
+import ipaddress
 import logging
 import re
+import time
 from base64 import b64encode, b64decode
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from cryptography.hazmat.primitives import serialization
 
 logger = logging.getLogger(__name__)
+
+# Dual-stack behaviour for AWG tunnels, overridable like the panel's other
+# environment knobs (SECRET_KEY, TUNNEL_BIN_DIR): "auto" probes the server,
+# "off" keeps every tunnel IPv4-only, "on" forces dual-stack.
+AWG_IPV6_ENV = 'AWG_IPV6'
+IPV6_FORCE_OFF = ('off', 'false', '0', 'no', 'disable', 'disabled')
+IPV6_FORCE_ON = ('on', 'true', '1', 'yes', 'force', 'forced')
 
 # Default AWG parameters (from protocols_defs.h)
 AWG_DEFAULTS = {
@@ -30,8 +39,7 @@ AWG_DEFAULTS = {
     'subnet_ip': '10.8.1.1',
     # IPv6 ULA subnet used for dual-stack tunnels (NAT66, no provider prefix needed)
     'subnet_ipv6_ip': 'fd42:8:1::1',
-    'subnet_ipv6_cidr': '64',
-    'dns1': '1.1.1.1',
+    'subnet_ipv6_cidr': '64',    'dns1': '1.1.1.1',
     'dns2': '1.0.0.1',
     # AWG obfuscation parameters
     'junk_packet_count': '3',
@@ -72,90 +80,10 @@ AWG3_CONFIG_KEYS = tuple(config_key for _, config_key in AWG3_PARAM_MAP)
 # "Invalid argument": the explanation only goes to net_dbg_ratelimited.
 AWG3_MIN_JUNK_SIZE = 12
 
-# Special junk packets I1-I5: free-form packets the peer sends right before
-# the handshake initiation, so a session opens with bytes that belong to some
-# other protocol. The kernel module parses each value as a list of tags
-# (jp_parse_tags in junk.c):
-#   <b 0xHEX>  fixed bytes          <r N>   N random bytes
-#   <c>        packet counter, 4B   <rc N>  N random latin letters
-#   <t>        unix time, 4B        <rd N>  N random digits
-SPECIAL_JUNK_KEYS = ('i1', 'i2', 'i3', 'i4', 'i5')
-
-# Byte-identical to protocols::awg::defaultSpecialJunk1 in the desktop client:
-# a DNS response for icloud.com preceded by a random 2-byte transaction id.
-AWG_DEFAULT_I1 = (
-    '<r 2><b 0x858000010001000000000669636c6f756403636f6d'
-    '0000010001c00c000100010000105a00044d583737>'
-)
-
-_SPECIAL_JUNK_TAG_RE = re.compile(r'<\s*(b|c|t|r|rc|rd)(?:\s+([^>]*?))?\s*>')
-
-# A junk packet still has to fit into one datagram.
-SPECIAL_JUNK_MAX_SIZE = 1280
-
-
-def validate_special_junk(value):
-    """Validate an I1-I5 value and return the packet size it produces.
-
-    Two failure modes make this worth checking before the value reaches a
-    server config. A tag the module cannot parse takes the whole interface
-    down with a bare EINVAL, and a value with no tags at all -- the literal
-    `I1 = 0` this panel used to write -- parses cleanly but builds a
-    zero-length packet, so nothing is ever sent and the config only looks
-    like obfuscation is on.
-    """
-    text = (value or '').strip()
-    if not text:
-        return 0
-
-    size = 0
-    pos = 0
-    for match in _SPECIAL_JUNK_TAG_RE.finditer(text):
-        between = text[pos:match.start()].strip()
-        if between:
-            raise ValueError(f"unexpected text outside a tag: {between!r}")
-        pos = match.end()
-
-        tag = match.group(1)
-        arg = (match.group(2) or '').strip()
-        if tag in ('c', 't'):
-            if arg:
-                raise ValueError(f"<{tag}> takes no argument")
-            size += 4
-        elif tag == 'b':
-            digits = arg[2:] if arg[:2].lower() == '0x' else ''
-            if not digits or len(digits) % 2 or not all(c in '0123456789abcdefABCDEF' for c in digits):
-                raise ValueError("<b> expects an even number of hex digits, e.g. <b 0xdeadbeef>")
-            size += len(digits) // 2
-        else:
-            if not arg.isdigit() or int(arg) <= 0:
-                raise ValueError(f"<{tag}> expects a positive byte count, e.g. <{tag} 16>")
-            size += int(arg)
-
-    trailing = text[pos:].strip()
-    if trailing:
-        raise ValueError(f"unexpected text outside a tag: {trailing!r}")
-    if size == 0:
-        raise ValueError("no packet tags found, nothing would be sent")
-    if size > SPECIAL_JUNK_MAX_SIZE:
-        raise ValueError(f"packet is {size} bytes, maximum is {SPECIAL_JUNK_MAX_SIZE}")
-    return size
-
-
-def normalize_special_junk(values):
-    """Validate a {'i1': ..., 'i5': ...} mapping and drop the empty entries."""
-    result = {}
-    for key in SPECIAL_JUNK_KEYS:
-        value = (values or {}).get(key)
-        value = (value or '').strip()
-        if not value:
-            continue
-        try:
-            validate_special_junk(value)
-        except ValueError as exc:
-            raise ValueError(f"{key.upper()}: {exc}") from exc
-        result[key] = value
-    return result
+# Connection flood monitoring (P2P/torrent detection)
+CONN_WARN_THRESHOLD = 600    # simultaneous connections per peer that trigger a warning
+CONN_WARN_COOLDOWN = 3600    # min seconds between two recorded warnings for the same peer
+CONN_WARN_MAX_EVENTS = 5     # how many recent warnings are kept per peer
 
 
 def generate_wg_keypair():
@@ -218,6 +146,16 @@ def generate_awg_params(use_ranges=False, awg3=False):
             return result
         
         h1, h2, h3, h4 = make_ranges()
+    elif awg3:
+        # AWG 3.1: the official docs prescribe the compatibility values
+        # 1,2,3,4 when HeaderProtection is enabled - the custom-header
+        # mechanism is OFF then and Header Protection (ChaCha20 with the
+        # random per-server HeaderProtectionKey) hides the message type.
+        # This is exactly what the native AmneziaVPN client generates.
+        # Ranged H1-H4 with RandomTrailers=on are actively harmful:
+        # transport packets get misclassified as handshakes and die at
+        # CheckMAC1 (amneziawg-go#186, kernel-module#226).
+        h1, h2, h3, h4 = '1', '2', '3', '4'
     else:
         h1 = str(random.randint(100000000, 4294967295))
         h2 = str(random.randint(100000000, 4294967295))
@@ -448,13 +386,51 @@ class AWGManager:
         prefix = gateway.rsplit(':', 1)[0] + ':'
         return f"{prefix}{octet:x}"
 
-    def _detect_server_ipv6(self):
-        """Check if the host has working IPv6 (default route or any global address)."""
+    def _detect_server_ipv6(self, protocol_type=None):
+        """Decide whether the tunnel should be dual-stack.
+
+        The AWG_IPV6 environment variable forces the answer ("off" / "on");
+        in the default "auto" mode the server is probed.
+
+        Auto-detection requires IPv6 to work end-to-end: a global address on
+        the host *and* a default IPv6 route inside the protocol container.
+        Docker networks are IPv4-only unless the daemon is explicitly
+        configured for IPv6, so checking the host alone can enable a
+        dual-stack tunnel whose NAT66 has nowhere to forward. Clients then
+        receive an IPv6 address, an IPv6 DNS server and ::/0 with no route
+        out, which blackholes traffic on IPv6-preferring clients (notably
+        macOS) even though the host's own IPv6 is fine.
+        """
+        mode = os.environ.get(AWG_IPV6_ENV, 'auto').strip().lower()
+        if mode in IPV6_FORCE_OFF:
+            logger.info("%s=%s, keeping the tunnel IPv4-only", AWG_IPV6_ENV, mode)
+            return False
+        if mode in IPV6_FORCE_ON:
+            logger.info("%s=%s, forcing a dual-stack tunnel", AWG_IPV6_ENV, mode)
+            return True
+
         out, _, _ = self.ssh.run_sudo_command("ip -6 route show default 2>/dev/null")
+        if not out.strip():
+            out, _, _ = self.ssh.run_sudo_command("ip -6 addr show scope global 2>/dev/null")
+            if not out.strip():
+                return False
+
+        if protocol_type is None:
+            return True
+
+        container_name = self._container_name(protocol_type)
+        out, _, _ = self.ssh.run_sudo_command(
+            f"docker exec {container_name} ip -6 route show default 2>/dev/null"
+        )
         if out.strip():
             return True
-        out, _, _ = self.ssh.run_sudo_command("ip -6 addr show scope global 2>/dev/null")
-        return bool(out.strip())
+
+        logger.info(
+            "Host has IPv6 but container %s has no IPv6 default route "
+            "(Docker IPv6 is disabled), keeping the tunnel IPv4-only",
+            container_name,
+        )
+        return False
 
     # ===================== INSTALLATION =====================
 
@@ -519,6 +495,32 @@ mkdir -p {dockerfile_folder}
 if ! docker network ls | grep -q amnezia-dns-net; then
   docker network create --driver bridge --subnet=172.29.172.0/24 --opt com.docker.network.bridge.name=amn0 amnezia-dns-net
 fi
+# Enable Docker IPv6 when the host has a global IPv6 address. Without this
+# containers get no IPv6 route and dual-stack tunnels silently fall back
+# to IPv4-only. Also enable ip6tables (+experimental): without them Docker
+# sets no NAT66 for the fixed-cidr-v6 ULA subnet and v6 traffic blackholes.
+# daemon.json is merged (not overwritten), backed up, docker restarted
+# only when the file actually changed.
+if ip -6 -o addr show scope global 2>/dev/null | grep -q inet6; then
+  cp /etc/docker/daemon.json /etc/docker/daemon.json.bak.awp 2>/dev/null
+  python3 - <<'PYEOF' 2>/dev/null || (grep -q '"ipv6"' /etc/docker/daemon.json 2>/dev/null || (echo '{{"ipv6": true, "fixed-cidr-v6": "fd00:42::/64", "experimental": true, "ip6tables": true}}' > /etc/docker/daemon.json && systemctl restart docker))
+import json, os, subprocess
+p = '/etc/docker/daemon.json'
+d = {{}}
+if os.path.exists(p):
+    d = json.load(open(p))
+need = {{'ipv6': True, 'experimental': True, 'ip6tables': True}}
+changed = False
+for k, v in need.items():
+    if d.get(k) != v:
+        d[k] = v; changed = True
+if 'fixed-cidr-v6' not in d:
+    d['fixed-cidr-v6'] = 'fd00:42::/64'; changed = True
+if changed:
+    json.dump(d, open(p, 'w'), indent=2)
+    subprocess.run(['systemctl', 'restart', 'docker'], check=False)
+PYEOF
+fi
 """
         out, err, code = self.ssh.run_sudo_script(script)
         if code != 0:
@@ -526,18 +528,104 @@ fi
         return True
 
     def setup_firewall(self):
-        """Setup host firewall (mirrors setup_host_firewall.sh)."""
+        """Setup host firewall (mirrors setup_host_firewall.sh).
+
+        Also raises net.netfilter.nf_conntrack_max: the default on small
+        VMs can be as low as ~7680 entries, and every client flow through
+        the NAT consumes one entry. A full conntrack table makes the
+        kernel silently drop packets ("nf_conntrack: table full"), which
+        users see as random connection freezes. 262144 is a safe value
+        for a VPN gateway; persisted via /etc/sysctl.d.
+        """
         script = """
 sysctl -w net.ipv4.ip_forward=1
 sysctl -w net.ipv6.conf.all.forwarding=1 2>/dev/null || true
 iptables -C INPUT -p icmp --icmp-type echo-request -j DROP 2>/dev/null || iptables -A INPUT -p icmp --icmp-type echo-request -j DROP
 iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-USER 2>/dev/null
+if [ -f /proc/sys/net/netfilter/nf_conntrack_max ]; then
+    cur=$(cat /proc/sys/net/netfilter/nf_conntrack_max)
+    if [ "$cur" -lt 262144 ] 2>/dev/null; then
+        printf '%s\n' 'net.netfilter.nf_conntrack_max = 262144' > /etc/sysctl.d/98-awp-conntrack.conf
+        sysctl -w net.netfilter.nf_conntrack_max=262144
+    fi
+fi
 """
         self.ssh.run_sudo_script(script)
         return True
 
-    def install_protocol(self, protocol_type, port=None, awg_params=None,
-                         mtu=None, dns=None, special_junk=None):
+    def setup_host_tuning(self):
+        """Enable BBR congestion control on the host (with persistence).
+
+        BBR is available in all kernels >= 4.9 (any modern Debian/Ubuntu).
+        If the tcp_bbr module is not loaded, load it and persist across
+        reboots. Falls back silently when the kernel has no BBR support.
+        BBR significantly outperforms cubic on lossy paths, which VPN
+        tunnels often traverse.
+        """
+        script = """
+set -e
+if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+    modprobe tcp_bbr 2>/dev/null || true
+fi
+if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+    echo tcp_bbr > /etc/modules-load.d/awp-bbr.conf
+    printf '%s\\n' \\
+        'net.core.default_qdisc = fq' \\
+        'net.ipv4.tcp_congestion_control = bbr' \\
+        > /etc/sysctl.d/99-awp-bbr.conf
+    sysctl -w net.core.default_qdisc=fq
+    sysctl -w net.ipv4.tcp_congestion_control=bbr
+fi
+"""
+        try:
+            self.ssh.run_sudo_script(script)
+        except Exception as err:
+            logger.warning(f"setup_host_tuning warning: {err}")
+        return True
+
+    def get_host_tuning(self):
+        """Read live network-tuning state for the whole server (host + all
+        AWG containers). Used by the server-level "Host tuning" modal.
+        """
+        script = """
+echo "HOST_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+echo "HOST_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null)"
+echo "HOST_CONNTRACK=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)"
+echo "HOST_CONNTRACK_COUNT=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)"
+echo "HOST_BACKLOG=$(sysctl -n net.core.netdev_max_backlog 2>/dev/null)"
+echo "HOST_SOMAXCONN=$(sysctl -n net.core.somaxconn 2>/dev/null)"
+for c in $(docker ps -a --format '{{.Names}}' | grep '^amnezia-awg' | sort); do
+  echo "CT_NAME=$c"
+  if docker ps --format '{{.Names}}' | grep -qx "$c"; then
+    echo "CT_RUNNING=1"
+    docker exec "$c" sh -c 'for p in net.core.rmem_max net.core.wmem_max net.ipv4.tcp_fastopen net.ipv4.tcp_mtu_probing; do echo "CTK_$p=$(sysctl -n $p 2>/dev/null)"; done; echo "CTK_nofile=$(ulimit -n)"' 2>/dev/null
+  else
+    echo "CT_RUNNING=0"
+  fi
+done
+"""
+        out, err, code = self.ssh.run_sudo_command(script, timeout=60)
+        info = {'host': {}, 'containers': []}
+        if code != 0 or not out:
+            return info
+        current = None
+        for line in out.splitlines():
+            if '=' not in line:
+                continue
+            key, _, val = line.partition('=')
+            key, val = key.strip(), val.strip()
+            if key.startswith('HOST_'):
+                info['host'][key[5:].lower()] = val
+            elif key == 'CT_NAME':
+                current = {'name': val, 'running': False, 'ct': {}}
+                info['containers'].append(current)
+            elif key == 'CT_RUNNING' and current is not None:
+                current['running'] = val == '1'
+            elif key.startswith('CTK_') and current is not None:
+                current['ct'][key[4:]] = val
+        return info
+
+    def install_protocol(self, protocol_type, port=None, awg_params=None):
         """
         Full installation of AWG or AWG-Legacy protocol.
         Steps: install docker -> prepare host -> build container ->
@@ -552,7 +640,11 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
         base_proto = self._base_protocol(protocol_type)
         if awg_params is None:
             awg_params = generate_awg_params(
-                use_ranges=(base_proto in (self.AWG, self.AWG2, self.AWG3)),
+                # AWG 2.0: ranged H1-H4 ("min-max"). AWG 3.1: fixed 1,2,3,4
+                # per the official docs (custom headers off, Header
+                # Protection hides the message type) - same as the native
+                # AmneziaVPN client generates.
+                use_ranges=(base_proto in (self.AWG, self.AWG2)),
                 awg3=(base_proto == self.AWG3),
             )
 
@@ -609,8 +701,32 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
             f"\n"
             f"RUN mkdir -p /opt/amnezia\n"
             f'RUN echo "#!/bin/bash" > /opt/amnezia/start.sh && '
+            f'echo "sysctl -p /etc/sysctl.conf 2>/dev/null || true" >> /opt/amnezia/start.sh && '
             f'echo "tail -f /dev/null" >> /opt/amnezia/start.sh\n'
             f"RUN chmod a+x /opt/amnezia/start.sh\n"
+            f"\n"
+            f"# Network tuning (mirrors AmneziaVPN container tuning)\n"
+            f"RUN printf '%s\\n' \\\n"
+            f"'fs.file-max = 51200' \\\n"
+            f"'net.core.rmem_max = 67108864' \\\n"
+            f"'net.core.wmem_max = 67108864' \\\n"
+            f"'net.core.netdev_max_backlog = 250000' \\\n"
+            f"'net.core.somaxconn = 4096' \\\n"
+            f"'net.ipv4.tcp_syncookies = 1' \\\n"
+            f"'net.ipv4.tcp_tw_reuse = 1' \\\n"
+            f"'net.ipv4.tcp_fin_timeout = 30' \\\n"
+            f"'net.ipv4.tcp_keepalive_time = 1200' \\\n"
+            f"'net.ipv4.ip_local_port_range = 10000 65000' \\\n"
+            f"'net.ipv4.tcp_max_syn_backlog = 8192' \\\n"
+            f"'net.ipv4.tcp_max_tw_buckets = 5000' \\\n"
+            f"'net.ipv4.tcp_fastopen = 3' \\\n"
+            f"'net.ipv4.tcp_mem = 25600 51200 102400' \\\n"
+            f"'net.ipv4.tcp_rmem = 4096 87380 67108864' \\\n"
+            f"'net.ipv4.tcp_wmem = 4096 65536 67108864' \\\n"
+            f"'net.ipv4.tcp_mtu_probing = 1' \\\n"
+            f" >> /etc/sysctl.conf && \\\n"
+            f"mkdir -p /etc/security && \\\n"
+            f"printf '%s\\n' '* soft nofile 51200' '* hard nofile 51200' >> /etc/security/limits.conf\n"
             f"\n"
             f'ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]\n'
         )
@@ -627,6 +743,17 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
 
         # Step 5: Run container
         results.append("Starting container...")
+        # Detect host IPv6 BEFORE creating the container: the netns
+        # disable_ipv6 flags are fixed at container creation time, so a
+        # container started without these sysctls can never add an IPv6
+        # address to a tunnel interface (ip -6 address add -> RTNETLINK
+        # Permission denied, and awg-quick then deletes the whole awg0).
+        ipv6_enabled = self._detect_server_ipv6()
+        ipv6_sysctls = (
+            '--sysctl="net.ipv6.conf.all.disable_ipv6=0" \\\n'
+            '--sysctl="net.ipv6.conf.default.disable_ipv6=0" \\\n'
+            if ipv6_enabled else ''
+        )
         run_cmd = f"""docker run -d \
 --restart always \
 --privileged \
@@ -635,6 +762,8 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
 -p {port}:{port}/udp \
 -v /lib/modules:/lib/modules \
 --sysctl="net.ipv4.conf.all.src_valid_mark=1" \
+{ipv6_sysctls} --name {container_name} \
+--ulimit nofile=51200:51200 \
 --name {container_name} \
 {container_name}"""
 
@@ -652,11 +781,11 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
 
         # Step 6: Configure container (generate server keys and config)
         results.append("Configuring AWG...")
-        ipv6_enabled = self._detect_server_ipv6()
+        ipv6_enabled = self._detect_server_ipv6(protocol_type)
         results.append(
-            "IPv6 detected on host, enabling dual-stack tunnel"
+            "IPv6 works end-to-end, enabling dual-stack tunnel"
             if ipv6_enabled else
-            "No IPv6 on host, tunnel will be IPv4-only"
+            "No usable IPv6 (host or Docker), tunnel will be IPv4-only"
         )
         self._configure_container(protocol_type, port, awg_params, ipv6=ipv6_enabled,
                                   mtu=mtu, dns=dns)
@@ -671,6 +800,11 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
         results.append("Setting up firewall...")
         self.setup_firewall()
         results.append("Firewall configured")
+
+        # Step 9: Host network tuning (BBR)
+        results.append("Applying host network tuning (BBR)...")
+        self.setup_host_tuning()
+        results.append("Host network tuning applied")
 
         return {
             'status': 'success',
@@ -821,6 +955,9 @@ H4 = {awg_params['transport_packet_magic_header']}
 
         start_script = f"""#!/bin/bash
 echo "Container startup"
+
+# Apply container network tuning (see Dockerfile)
+sysctl -p /etc/sysctl.conf 2>/dev/null || true
 
 # Read subnet from server config dynamically (IPv4 part of the Address line)
 SUBNET=$(grep '^Address' {config_path} | head -1 | cut -d'=' -f2 | cut -d',' -f1 | tr -d ' ')
@@ -974,6 +1111,9 @@ tail -f /dev/null
         quick_bin = self._quick_binary(protocol_type)
         start_script = f"""#!/bin/bash
 echo "Container startup"
+
+# Apply container network tuning (see Dockerfile)
+sysctl -p /etc/sysctl.conf 2>/dev/null || true
 
 # Read subnet from server config dynamically (IPv4 part of the Address line)
 SUBNET=$(grep '^Address' {config_path} | head -1 | cut -d'=' -f2 | cut -d',' -f1 | tr -d ' ')
@@ -1272,6 +1412,31 @@ tail -f /dev/null
         except Exception as e:
             logger.warning(f'get_clients: failed to parse conf peers: {e}')
 
+        # Connection flood monitoring: attach the latest snapshot written by
+        # the background collector (collect_conn_stats). Only if the snapshot
+        # does not exist yet (fresh install / right after upgrade) fall back
+        # to a one-off live count so the UI is not empty for the first minute.
+        try:
+            conn_counts = self._load_conn_counts(protocol_type)
+            if not conn_counts:
+                conn_counts = self._count_connections_by_ip(protocol_type)
+            conn_warnings = self._load_conn_warnings(protocol_type)
+            for client in clients_table:
+                user_data = client.get('userData', {})
+                ip = user_data.get('clientIp', '')
+                if not ip:
+                    m = re.search(r'(\d+\.\d+\.\d+\.\d+)', user_data.get('allowedIps', '') or '')
+                    ip = m.group(1) if m else ''
+                if not ip:
+                    continue
+                user_data['clientIp'] = ip
+                user_data['connCount'] = conn_counts.get(ip, 0)
+                if ip in conn_warnings:
+                    user_data['connWarnings'] = conn_warnings[ip]
+                client['userData'] = user_data
+        except Exception as e:
+            logger.warning(f'get_clients: conn monitoring failed: {e}')
+
         return clients_table
 
     def _parse_bytes(self, size_str):
@@ -1284,6 +1449,168 @@ tail -f /dev/null
             return int(val * units.get(unit, 1))
         except Exception:
             return 0
+
+    # ---- Connection flood monitoring (P2P/torrent detection) ----
+
+    def _conn_warnings_path(self):
+        """Path inside container, next to clientsTable (persisted via volume)."""
+        return '/opt/amnezia/awg/conn_warnings.json'
+
+    def _count_connections_by_ip(self, protocol_type):
+        """Count conntrack entries per peer IP.
+
+        Aggregates /proc/net/nf_conntrack INSIDE the instance container
+        (NAT for the VPN subnet happens in the container's netns, so the
+        host table only shows the container's own IP) and transfers only
+        the compact "count ip" summary instead of the multi-megabyte raw
+        table.
+        Returns {ip: count}; empty dict if conntrack is unavailable.
+        """
+        try:
+            subnet_ip = self._get_subnet_ip(protocol_type)
+            cidr = int(self._get_subnet_cidr(protocol_type))
+            network = ipaddress.ip_network(f'{subnet_ip}/{cidr}', strict=False)
+        except Exception:
+            return {}
+
+        container = self._container_name(protocol_type)
+        # tr/grep/cut pipeline instead of awk: the command travels through a
+        # double remote shell (ssh + sh -c "..."), which mangles awk's $i
+        # fields no matter how they are escaped. Each conntrack line has two
+        # src= tokens (peer + external); the subnet filter below keeps only
+        # peer IPs, so counts match the awk version.
+        count_cmd = ("tr ' ' '\\n' < /proc/net/nf_conntrack 2>/dev/null "
+                     "| grep '^src=' | cut -d= -f2 | sort | uniq -c")
+        out, err, code = self.ssh.run_sudo_command(
+            f'docker exec -i {container} sh -c "{count_cmd}"'
+        )
+        if code != 0 or not out.strip():
+            return {}
+
+        counts = {}
+        for line in out.split('\n'):
+            parts = line.split()
+            if len(parts) != 2:
+                continue
+            cnt_s, ip = parts
+            try:
+                if ipaddress.ip_address(ip) in network:
+                    counts[ip] = int(cnt_s)
+            except ValueError:
+                continue
+        return counts
+
+    def _conn_counts_path(self):
+        """Path inside container with the latest per-IP connection counts."""
+        return '/opt/amnezia/awg/conn_counts.json'
+
+    def _load_conn_counts(self, protocol_type):
+        """Load latest {ip: count} snapshot written by the collector."""
+        container_name = self._container_name(protocol_type)
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker exec -i {container_name} cat {self._conn_counts_path()} 2>/dev/null"
+        )
+        if code != 0 or not out.strip():
+            return {}
+        try:
+            data = json.loads(out)
+            return {k: int(v) for k, v in data.items()} if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return {}
+
+    def _save_conn_counts(self, protocol_type, counts):
+        """Persist the {ip: count} snapshot into the container."""
+        container_name = self._container_name(protocol_type)
+        self.ssh.upload_file(json.dumps(counts), "/tmp/_amnz_conncount.json")
+        self.ssh.run_sudo_command(
+            f"docker cp /tmp/_amnz_conncount.json {container_name}:{self._conn_counts_path()}"
+        )
+        self.ssh.run_command("rm -f /tmp/_amnz_conncount.json")
+
+    def collect_conn_stats(self, protocol_type):
+        """Background collector: one cheap SSH roundtrip per instance.
+
+        Counts conntrack entries per peer IP inside the container (compact
+        awk summary, no raw table transfer), saves the snapshot and records
+        flood warnings. Called by the panel's background monitor so that
+        detection runs 24/7 even when nobody has the UI open.
+        """
+        counts = self._count_connections_by_ip(protocol_type)
+        if not counts:
+            return False
+        try:
+            self._save_conn_counts(protocol_type, counts)
+        except Exception as e:
+            logger.warning(f'failed to save conn counts: {e}')
+        self._update_conn_warnings(protocol_type, counts)
+        return True
+
+    def _load_conn_warnings(self, protocol_type):
+        """Load recorded warnings {ip: [{ts, count}, ...]} from the container."""
+        container_name = self._container_name(protocol_type)
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker exec -i {container_name} cat {self._conn_warnings_path()} 2>/dev/null"
+        )
+        if code != 0 or not out.strip():
+            return {}
+        try:
+            data = json.loads(out)
+            return data if isinstance(data, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+
+    def _save_conn_warnings(self, protocol_type, warnings):
+        """Persist warnings into the container (same pattern as clientsTable)."""
+        container_name = self._container_name(protocol_type)
+        self.ssh.upload_file(json.dumps(warnings), "/tmp/_amnz_connwarn.json")
+        self.ssh.run_sudo_command(
+            f"docker cp /tmp/_amnz_connwarn.json {container_name}:{self._conn_warnings_path()}"
+        )
+        self.ssh.run_command("rm -f /tmp/_amnz_connwarn.json")
+
+    def _update_conn_warnings(self, protocol_type, counts):
+        """Record a warning for every peer above CONN_WARN_THRESHOLD.
+
+        At most one warning per peer per CONN_WARN_COOLDOWN seconds; only the
+        last CONN_WARN_MAX_EVENTS are kept. Returns {ip: [{ts, count}, ...]}.
+        """
+        warnings = self._load_conn_warnings(protocol_type)
+        now = int(time.time())
+        changed = False
+        for ip, count in counts.items():
+            if count < CONN_WARN_THRESHOLD:
+                continue
+            events = warnings.get(ip, [])
+            if events and now - int(events[-1].get('ts', 0)) < CONN_WARN_COOLDOWN:
+                continue
+            events.append({'ts': now, 'count': count})
+            warnings[ip] = events[-CONN_WARN_MAX_EVENTS:]
+            changed = True
+        if changed:
+            try:
+                self._save_conn_warnings(protocol_type, warnings)
+            except Exception as e:
+                logger.warning(f'failed to save conn warnings: {e}')
+        return warnings
+
+    def clear_conn_warnings(self, protocol_type, client_id):
+        """Clear all recorded connection-flood warnings for one peer."""
+        clients_table = self._get_clients_table(protocol_type)
+        client = next((c for c in clients_table if c.get('clientId') == client_id), None)
+        ip = None
+        if client:
+            ud = client.get('userData', {}) or {}
+            ip = ud.get('clientIp')
+            if not ip:
+                m = re.search(r'(\d+\.\d+\.\d+\.\d+)', ud.get('allowedIps', '') or '')
+                ip = m.group(1) if m else None
+        if not ip:
+            raise RuntimeError('Client IP not found')
+        warnings = self._load_conn_warnings(protocol_type)
+        if ip in warnings:
+            warnings.pop(ip, None)
+            self._save_conn_warnings(protocol_type, warnings)
+        return {'status': 'success', 'cleared_ip': ip}
 
     def _wg_show(self, protocol_type):
         """Run 'wg show all' and parse output."""
@@ -1431,12 +1758,17 @@ AllowedIPs = {allowed_ips}
                     continue
                 config_lines.append(f"{config_key} = {val}")
 
+        # Route ::/0 only when the client actually holds an IPv6 address:
+        # claiming the IPv6 default route on an IPv4-only tunnel blackholes
+        # the client's own native IPv6.
+        peer_allowed_ips = "0.0.0.0/0, ::/0" if client_ipv6 else "0.0.0.0/0"
+
         client_config = "[Interface]\n" + "\n".join(config_lines) + f"""
 
 [Peer]
 PublicKey = {server_pub_key}
 PresharedKey = {psk}
-AllowedIPs = 0.0.0.0/0, ::/0
+AllowedIPs = {peer_allowed_ips}
 Endpoint = {server_host}:{port}
 PersistentKeepalive = 25
 """
@@ -1522,12 +1854,15 @@ PersistentKeepalive = 25
                     continue
                 config_lines.append(f"{config_key} = {val}")
 
+        # See the client-creation path: ::/0 only on dual-stack tunnels.
+        peer_allowed_ips = "0.0.0.0/0, ::/0" if client_ipv6 else "0.0.0.0/0"
+
         config = "[Interface]\n" + "\n".join(config_lines) + f"""
 
 [Peer]
 PublicKey = {server_pub_key}
 PresharedKey = {psk}
-AllowedIPs = 0.0.0.0/0, ::/0
+AllowedIPs = {peer_allowed_ips}
 Endpoint = {server_host}:{port}
 PersistentKeepalive = 25
 """

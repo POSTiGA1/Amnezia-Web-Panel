@@ -105,6 +105,8 @@
   "connection_name_placeholder": "مثال: iPhone, Laptop",
   "assign_to_user": "تخصیص به کاربر (اختیاری)",
   "no_assign": "— بدون تخصیص —",
+  "select_search_placeholder": "جستجو...",
+  "select_search_empty": "موردی یافت نشد",
   "create": "ایجاد",
   "creating": "در حال ایجاد...",
   "connection_created": "اتصال \"{}\" ایجاد شد",
@@ -417,5 +419,9 @@
   "reset_traffic": "بازنشانی ترافیک",
   "resetting": "در حال بازنشانی...",
   "reset_traffic_confirm": "ترافیک فعلی این کاربر بازنشانی شود؟ آمار کل حفظ میشود.",
-  "traffic_reset_success": "ترافیک بازنشانی شد"
+  "traffic_reset_success": "ترافیک بازنشانی شد",
+  "host_tuning": "تنظیمات میزبان",
+  "conn_warning_text": "⚠️ هشدار: در {date} ساعت {time} تعداد {count} اتصال باز شد!",
+  "clear_warnings": "پاک کردن هشدارها",
+  "warnings_cleared": "هشدارها پاک شدند"
 }
