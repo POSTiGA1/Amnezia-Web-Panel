@@ -80,6 +80,45 @@ AWG3_CONFIG_KEYS = tuple(config_key for _, config_key in AWG3_PARAM_MAP)
 # "Invalid argument": the explanation only goes to net_dbg_ratelimited.
 AWG3_MIN_JUNK_SIZE = 12
 
+# AWG 3.1 keys only exist in amneziawg kernel module 3.0+ (the 1.0.x line the
+# Amnezia PPA still ships predates them). awg-quick prefers the host module and
+# falls back to amneziawg-go only when `ip link add ... type amneziawg` fails,
+# i.e. when no module is installed at all. With an older module loaded the
+# interface is created, `awg setconf` then fails with a bare "Invalid argument"
+# and awg-quick deletes the interface again: the install reports success and no
+# tunnel exists (issue #113). The container's amneziawg-go does speak the full
+# 3.1 key set, so the way out is to force userspace for awg3 on such hosts.
+AWG3_MIN_KERNEL_MODULE_MAJOR = 3
+
+# awg-quick has no switch for that, so the image gets a one-line patch adding
+# one. Without WG_FORCE_USERSPACE set the function behaves exactly as before.
+AWG_QUICK_FORCE_USERSPACE_PATCH = (
+    'RUN sed -i \'s|if ! cmd ip link add "$INTERFACE" type amneziawg; then'
+    '|if [ -n "$WG_FORCE_USERSPACE" ]; then'
+    ' cmd "${WG_QUICK_USERSPACE_IMPLEMENTATION:-amneziawg-go}" "$INTERFACE";'
+    ' return 0; fi;'
+    ' if ! cmd ip link add "$INTERFACE" type amneziawg; then|\' /usr/bin/awg-quick'
+    ' && grep -q WG_FORCE_USERSPACE /usr/bin/awg-quick\n'
+)
+
+# Runs inside the awg3 container before awg-quick. Creating a throwaway
+# interface both loads the module (a module present on disk but not yet loaded
+# would otherwise read as absent) and proves the container can reach it.
+AWG3_USERSPACE_GUARD = """
+# AWG 3.1 needs amneziawg kernel module 3.0+; an older one accepts the
+# interface but rejects the config, and awg-quick will not fall back once
+# `ip link add` has succeeded (issue #113).
+if ip link add awgprobe type amneziawg 2>/dev/null; then
+  KMOD_VERSION=$(cat /sys/module/amneziawg/version 2>/dev/null)
+  ip link delete awgprobe 2>/dev/null
+  case "$KMOD_VERSION" in
+    3.*|[4-9].*|[1-9][0-9].*) ;;
+    *) echo "amneziawg kernel module ${KMOD_VERSION:-unknown} predates AWG 3.1, using userspace amneziawg-go"
+       export WG_FORCE_USERSPACE=1 ;;
+  esac
+fi
+"""
+
 # Special junk packets I1-I5: free-form packets the peer sends right before
 # the handshake initiation, so a session opens with bytes that belong to some
 # other protocol. The kernel module parses each value as a list of tags
@@ -509,6 +548,56 @@ class AWGManager:
         )
         return False
 
+    def _userspace_guard(self, protocol_type):
+        """Shell snippet forcing userspace for awg3 on a pre-3.1 kernel module."""
+        if self._base_protocol(protocol_type) != self.AWG3:
+            return ''
+        return AWG3_USERSPACE_GUARD
+
+    def _host_awg_module_version(self):
+        """Version of the amneziawg kernel module on the host, or None.
+
+        modinfo covers the module that is installed but not loaded yet: the
+        container loads it implicitly on the first `ip link add`, so it counts.
+        """
+        out, _, _ = self.ssh.run_sudo_command(
+            "cat /sys/module/amneziawg/version 2>/dev/null || "
+            "modinfo -F version amneziawg 2>/dev/null"
+        )
+        version = out.strip().split('\n')[0].strip()
+        return version or None
+
+    @staticmethod
+    def _module_supports_awg3(version):
+        """Whether an amneziawg module version speaks the AWG 3.1 key set."""
+        try:
+            return int(version.split('.')[0]) >= AWG3_MIN_KERNEL_MODULE_MAJOR
+        except (AttributeError, ValueError):
+            return False
+
+    def _verify_interface_up(self, protocol_type):
+        """Fail loudly when the tunnel interface did not survive awg-quick.
+
+        A config the kernel module rejects leaves a running container with no
+        interface at all, which used to be reported to the UI as a successful
+        install (issue #113).
+        """
+        container_name = self._container_name(protocol_type)
+        iface = self._interface_name(protocol_type)
+        _, _, code = self.ssh.run_sudo_command(
+            f"docker exec {container_name} ip link show {iface}"
+        )
+        if code == 0:
+            return
+
+        logs, _, _ = self.ssh.run_sudo_command(
+            f"docker logs --tail 20 {container_name} 2>&1"
+        )
+        raise RuntimeError(
+            f"{iface} is not up in {container_name}: the tunnel config was "
+            f"rejected. Container log:\n{logs.strip()}"
+        )
+
     # ===================== INSTALLATION =====================
 
     def check_docker_installed(self):
@@ -765,6 +854,15 @@ done
             results.append("Old container removed")
 
         # Step 4: Build/Pull container
+        if base_proto == self.AWG3:
+            module_version = self._host_awg_module_version()
+            if module_version and not self._module_supports_awg3(module_version):
+                results.append(
+                    f"! Host amneziawg kernel module {module_version} predates "
+                    f"AWG 3.1, the tunnel will run on userspace amneziawg-go "
+                    f"(slower). Upgrade the module to 3.1+ for the kernel "
+                    f"datapath."
+                )
         results.append("Pulling Docker image...")
         dockerfile_folder = f"/opt/amnezia/{container_name}"
 
@@ -776,6 +874,11 @@ done
             f"\n"
             f"RUN apk add --no-cache bash curl dumb-init iptables\n"
             f"RUN apk --update upgrade --no-cache\n"
+            f"\n"
+            # Only the AWG images ship awg-quick; the legacy one runs wg-quick
+            # against the plain WireGuard module, which has nothing to fall
+            # back to.
+            f"{AWG_QUICK_FORCE_USERSPACE_PATCH if base_proto in (self.AWG, self.AWG2, self.AWG3) else ''}"
             f"\n"
             f"RUN mkdir -p /opt/amnezia\n"
             f'RUN echo "#!/bin/bash" > /opt/amnezia/start.sh && '
@@ -872,6 +975,7 @@ done
         # Step 7: Upload and run start script
         results.append("Starting AWG service...")
         self._upload_start_script(protocol_type, port, awg_params)
+        self._verify_interface_up(protocol_type)
         results.append("AWG service started")
 
         # Step 8: Setup firewall
@@ -1030,6 +1134,7 @@ H4 = {awg_params['transport_packet_magic_header']}
         container_name = self._container_name(protocol_type)
         quick_bin = self._quick_binary(protocol_type)
         config_path = self._config_path(protocol_type)
+        userspace_guard = self._userspace_guard(protocol_type)
 
         start_script = f"""#!/bin/bash
 echo "Container startup"
@@ -1045,7 +1150,7 @@ fi
 
 # IPv6 subnet, if the tunnel is dual-stack (second part of the Address line)
 SUBNET6=$(grep '^Address' {config_path} | head -1 | tr ',' '\n' | grep ':' | sed 's/^[^=]*=//' | tr -d ' ' | head -1)
-
+{userspace_guard}
 # kill daemons in case of restart
 {quick_bin} down {config_path} 2>/dev/null
 
@@ -1187,6 +1292,7 @@ tail -f /dev/null
 
         # Regenerate start script so iptables rules pick up the (possibly changed) subnet
         quick_bin = self._quick_binary(protocol_type)
+        userspace_guard = self._userspace_guard(protocol_type)
         start_script = f"""#!/bin/bash
 echo "Container startup"
 
@@ -1201,7 +1307,7 @@ fi
 
 # IPv6 subnet, if the tunnel is dual-stack (second part of the Address line)
 SUBNET6=$(grep '^Address' {config_path} | head -1 | tr ',' '\n' | grep ':' | sed 's/^[^=]*=//' | tr -d ' ' | head -1)
-
+{userspace_guard}
 # kill daemons in case of restart
 {quick_bin} down {config_path} 2>/dev/null
 
