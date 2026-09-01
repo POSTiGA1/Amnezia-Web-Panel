@@ -425,5 +425,6 @@
   "clear_warnings": "清除警告",
   "warnings_cleared": "警告已清除",
   "max_speed": "最大速度 (Mbps)",
-  "speed_limit_unlim": "速度限制（0 = 不限）"
+  "speed_limit_unlim": "速度限制（0 = 不限）",
+  "port_in_use_by": "端口 {port} 已被 {owner} 占用，请选择其他端口。"
 }

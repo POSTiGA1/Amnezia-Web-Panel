@@ -425,5 +425,6 @@
   "clear_warnings": "Effacer les avertissements",
   "warnings_cleared": "Avertissements effacés",
   "max_speed": "Vitesse max (Mbps)",
-  "speed_limit_unlim": "Limite de vitesse (0 = illimité)"
+  "speed_limit_unlim": "Limite de vitesse (0 = illimité)",
+  "port_in_use_by": "Le port {port} est déjà utilisé par {owner}. Choisissez un autre port."
 }

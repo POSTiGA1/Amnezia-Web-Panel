@@ -458,5 +458,6 @@
   "clear_warnings": "Clear warnings",
   "warnings_cleared": "Warnings cleared",
   "max_speed": "Max speed (Mbps)",
-  "speed_limit_unlim": "Speed limit (0 = unlim.)"
+  "speed_limit_unlim": "Speed limit (0 = unlim.)",
+  "port_in_use_by": "Port {port} is already used by {owner}. Choose another port."
 }
