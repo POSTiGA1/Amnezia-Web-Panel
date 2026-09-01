@@ -437,6 +437,7 @@
   "resetting": "Resetting...",
   "reset_traffic_confirm": "Reset this user's current traffic? Total statistics will be kept.",
   "traffic_reset_success": "Traffic reset",
+  "host_tuning": "Host tuning",
   "conn_warning_text": "⚠️ Warning: {count} connections opened at {time} on {date}!",
   "clear_warnings": "Clear warnings",
   "warnings_cleared": "Warnings cleared"

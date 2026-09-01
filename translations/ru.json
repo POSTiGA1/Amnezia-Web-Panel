@@ -437,6 +437,7 @@
   "resetting": "Сброс...",
   "reset_traffic_confirm": "Сбросить текущий трафик пользователя? Общая статистика сохранится.",
   "traffic_reset_success": "Трафик сброшен",
+  "host_tuning": "Конфигурация",
   "conn_warning_text": "⚠️ Внимание: {date} в {time} открыто {count} соединений!",
   "clear_warnings": "Очистить предупреждения",
   "warnings_cleared": "Предупреждения очищены"
